@@ -44,6 +44,7 @@ class Context:
     passphrase = None
     dry_run = False
     progress_callback = None
+    borg_remote_path = None
 
 
 class Backend(metaclass=abc.ABCMeta):

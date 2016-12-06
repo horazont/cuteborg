@@ -1,5 +1,7 @@
 import ast
+import asyncio
 import functools
+import os
 import re
 import subprocess
 
@@ -137,10 +139,8 @@ class LocalSubprocessBackend(backend.Backend):
 
     def _get_version(self):
         try:
-            s = self._call(
-                ["--version"],
-                {},
-                backend.Context()
+            s = subprocess.check_output(
+                [self.path_to_borg, "--version"],
             ).decode("ascii")
             version = parse_version(s)
         except ValueError as exc:
@@ -151,6 +151,12 @@ class LocalSubprocessBackend(backend.Backend):
 
     def _check_version(self):
         version = self._get_version()
+
+        self.logger.debug(
+            "detected Borg version %s", ".".join(
+                map(str, version)
+            )
+        )
 
         for ge_version, lt_version in self.SUPPORTED_VERSION_RANGES:
             if ge_version <= version < lt_version:
@@ -176,7 +182,8 @@ class LocalSubprocessBackend(backend.Backend):
         if context.dry_run:
             args.insert(2, "-n")
 
-        env = dict(env)
+        env = dict(os.environ)
+        env.update(env)
         env["LANG"] = "C"
 
         self.logger.debug(
@@ -188,31 +195,73 @@ class LocalSubprocessBackend(backend.Backend):
         if context.passphrase is not None:
             env["BORG_PASSPHRASE"] = context.passphrase
 
+        if context.borg_remote_path is not None:
+            env["BORG_REMOTE_PATH"] = context.borg_remote_path
+
         return args, env
 
-    def _call(self, args, env, context):
-        args, env = self._prep_call(args, env, context)
-        return subprocess.check_output(
-            args,
+    # def _call_and_wait(self, args, env, context):
+    #     args, env = self._prep_call(args, env, context)
+    #     return subprocess.check_output(
+    #         args,
+    #         env=env,
+    #     )
+
+    # def _call_lines(self, args, env, context, line_callback):
+    #     args, env = self._prep_call(args, env, context)
+
+    #     proc = subprocess.Popen(
+    #         args,
+    #         env=env,
+    #         stderr=subprocess.PIPE,
+    #         universal_newlines=True,
+    #     )
+
+    #     for line in proc.stderr:
+    #         if not line:
+    #             break
+    #         line_callback(line)
+
+    #     proc.wait()
+
+    @asyncio.coroutine
+    def _call(self, args, env):
+        proc = yield from asyncio.create_subprocess_exec(
+            *args,
             env=env,
         )
 
-    def _call_lines(self, args, env, context, line_callback):
-        args, env = self._prep_call(args, env, context)
+        yield from proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode,
+                args,
+            )
 
-        proc = subprocess.Popen(
-            args,
-            env=env,
+    @asyncio.coroutine
+    def _call_lines(self, args, env, line_callback):
+        proc = yield from asyncio.create_subprocess_exec(
+            *args,
             stderr=subprocess.PIPE,
-            universal_newlines=True,
+            env=env,
         )
 
-        for line in proc.stderr:
-            if not line:
-                break
-            line_callback(line)
+        potential_information = bytearray()
+        try:
+            while True:
+                line = yield from proc.stderr.readuntil(b"\r")
+                potential_information.extend(line)
+                line_callback(line.decode())
+        except asyncio.streams.IncompleteReadError as exc:
+            potential_information.extend(exc.partial)
 
-        proc.wait()
+        yield from proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode,
+                args,
+                stderr=potential_information
+            )
 
     def init_repository(self, path, mode, context):
         args = [
@@ -231,9 +280,10 @@ class LocalSubprocessBackend(backend.Backend):
 
         return self._call(args, {}, context)
 
+    @asyncio.coroutine
     def prune_repository(self, path,
                          context,
-                         prefix=None,
+                         prefix,
                          *,
                          hourly=None,
                          daily=None,
@@ -259,7 +309,7 @@ class LocalSubprocessBackend(backend.Backend):
                 ("yearly", yearly)]:
             if value is not None:
                 args.extend([
-                    "--{}".format(key),
+                    "--keep-{}".format(key),
                     str(value),
                 ])
 
@@ -268,8 +318,11 @@ class LocalSubprocessBackend(backend.Backend):
                 "--keep-within", str(keep_within)
             ])
 
-        return self._call(args, {}, context)
+        args, env = self._prep_call(args, {}, context)
 
+        return (yield from self._call(args, env))
+
+    @asyncio.coroutine
     def create_archive(self, path, name, source_paths, context):
         args = [
             "create",
@@ -311,16 +364,21 @@ class LocalSubprocessBackend(backend.Backend):
         args.append("--")
         args.extend(map(str, source_paths))
 
-        if context.progress_callback is not None:
-            return self._call_lines(
-                args, env, context,
-                functools.partial(
-                    forward_create_progress,
-                    context.progress_callback,
+        args, env = self._prep_call(args, env, context)
+
+        line_proc = functools.partial(
+            forward_create_progress,
+            context.progress_callback or (lambda x: None),
+        )
+
+        try:
+            yield from self._call_lines(args, env, line_proc)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "create_archive operation failed: {}".format(
+                    exc.stderr.decode()
                 )
-            )
-        else:
-            return self._call(args, env, context)
+            ) from None
 
     def get_archive_info(self, path, name, context):
         args = [
@@ -406,6 +464,7 @@ class LocalSubprocessBackend(backend.Backend):
 
         return items
 
+    @asyncio.coroutine
     def delete_archive(self, path, name, context):
         args = [
             "delete",
@@ -417,18 +476,21 @@ class LocalSubprocessBackend(backend.Backend):
         if context.progress_callback:
             args.append("--progress")
 
-        if context.progress_callback:
-            return self._call_lines(
-                args,
-                env,
-                context,
-                functools.partial(
-                    forward_delete_progress,
-                    context.progress_callback,
-                )
+        args, env = self._prep_call(args, env, context)
+
+        line_proc = functools.partial(
+            forward_delete_progress,
+            context.progress_callback or (lambda x: None),
+        )
+
+        yield from self._call_lines(
+            args,
+            env,
+            functools.partial(
+                forward_delete_progress,
+                context.progress_callback,
             )
-        else:
-            return self._call(args, env, context)
+        )
 
     def delete_archive_cache(self, path, name, context):
         args = [

@@ -1,3 +1,5 @@
+import asyncio
+
 import cuteborg.backend
 import cuteborg.subprocess_backend
 
@@ -5,23 +7,34 @@ import cuteborg.subprocess_backend
 def progress(line):
     print(repr(line))
 
-# 13.62 MB O 13.62 MB C 13.62 MB D 405 N scripts.irssi.org...scripts/ignore_log.pl
+
+# 13.62 MB O 13.62 MB C 13.62 MB D 405 N
 
 
-ctx = cuteborg.backend.Context()
-ctx.progress_callback = progress
-ctx.compression = cuteborg.backend.CompressionMethod.LZMA
+async def test():
+    ctx = cuteborg.backend.Context()
 
-b = cuteborg.subprocess_backend.LocalSubprocessBackend()
-b.create_archive(
-    "/home/horazont/tmp/repositories/fnord",
-    "test2",
-    ["/home/horazont/Projects/python/aioxmpp"],
-    ctx,
-)
+    ctx.progress_callback = progress
+    ctx.compression = cuteborg.backend.CompressionMethod.LZMA
 
-b.delete_archive(
-    "/home/horazont/tmp/repositories/fnord",
-    "test2",
-    ctx,
-)
+    b = cuteborg.subprocess_backend.LocalSubprocessBackend()
+
+    await b.create_archive(
+        "/home/horazont/tmp/repositories/fnord",
+        "test2",
+        ["/home/horazont/Projects/python/aioxmpp"],
+        ctx,
+    )
+
+    await b.delete_archive(
+        "/home/horazont/tmp/repositories/fnord",
+        "test2",
+        ctx,
+    )
+
+
+loop = asyncio.get_event_loop()
+try:
+    loop.run_until_complete(test())
+finally:
+    loop.close()

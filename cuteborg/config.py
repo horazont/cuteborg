@@ -58,10 +58,72 @@ class ConfigElementBase(metaclass=abc.ABCMeta):
         return {}
 
 
+class PruneConfig(ConfigElementBase):
+    hourly = None
+    daily = None
+    weekly = None
+    monthly = None
+    yearly = None
+    keep_within = None
+
+    schedule = None
+
+    def load_from_raw(self, raw):
+        self.hourly = raw.get("hourly")
+        self.daily = raw.get("daily")
+        self.weekly = raw.get("weekly")
+        self.monthly = raw.get("monthly")
+        self.yearly = raw.get("yearly")
+        self.keep_within = raw.get("keep_within")
+
+        try:
+            schedule_cfg = raw["schedule"]
+        except KeyError:
+            pass
+        else:
+            self.schedule = ScheduleConfig.from_raw(schedule_cfg)
+
+    def _set_raw_attr(self, raw, attr):
+        value = getattr(self, attr)
+        if value is not None:
+            raw[attr] = value
+
+    def to_raw(self):
+        raw = super().to_raw()
+        self._set_raw_attr(raw, "hourly")
+        self._set_raw_attr(raw, "daily")
+        self._set_raw_attr(raw, "weekly")
+        self._set_raw_attr(raw, "monthly")
+        self._set_raw_attr(raw, "yearly")
+        self._set_raw_attr(raw, "keep_within")
+
+        if self.schedule is not None:
+            raw["schedule"] = self.schedule.to_raw()
+
+        return raw
+
+    @classmethod
+    def from_raw(cls, raw):
+        self = cls()
+        self.load_from_raw(raw)
+        return self
+
+    def to_kwargs(self):
+        return {
+            "hourly": self.hourly,
+            "daily": self.daily,
+            "weekly": self.weekly,
+            "monthly": self.monthly,
+            "yearly": self.yearly,
+            "keep_within": self.keep_within,
+        }
+
+
 class RepositoryConfig(ConfigElementBase):
     id_ = None
     encryption_mode = None
     encryption_passphrase = None
+    prune = None
 
     @abc.abstractmethod
     def load_from_raw(self, raw):
@@ -72,6 +134,13 @@ class RepositoryConfig(ConfigElementBase):
         self.encryption_mode = EncryptionMode(encryption_cfg["mode"])
         self.encryption_passphrase = encryption_cfg.get("passphrase")
 
+        try:
+            prune_cfg = raw["prune"]
+        except KeyError:
+            self.prune = None
+        else:
+            self.prune = PruneConfig.from_raw(prune_cfg)
+
     @abc.abstractmethod
     def to_raw(self):
         raw = super().to_raw()
@@ -81,6 +150,10 @@ class RepositoryConfig(ConfigElementBase):
         encryption_cfg["mode"] = self.encryption_mode.value
         if self.encryption_passphrase is not None:
             encryption_cfg["passphrase"] = self.encryption_passphrase
+
+        if self.prune is not None:
+            prune_cfg = self.prune.to_raw()
+            raw["prune"] = prune_cfg
 
         return raw
 
@@ -151,6 +224,12 @@ class LocalRepositoryConfig(RepositoryConfig):
 
         return raw
 
+    def make_repository_path(self):
+        return self.path
+
+    def setup_context(self, ctx):
+        pass
+
 
 class RemoteRepositoryConfig(RepositoryConfig):
     path = None
@@ -185,6 +264,19 @@ class RemoteRepositoryConfig(RepositoryConfig):
 
         return raw
 
+    def make_repository_path(self):
+        parts = ["ssh://"]
+        if self.user is not None:
+            parts.append(self.user)
+            parts.append("@")
+        parts.append(self.host)
+        parts.append(self.path)
+
+        return "".join(parts)
+
+    def setup_context(self, ctx):
+        ctx.borg_remote_path = self.borg_path
+
 
 class ScheduleConfig(ConfigElementBase):
     interval_unit = None
@@ -214,6 +306,22 @@ class ScheduleConfig(ConfigElementBase):
         self.load_from_raw(raw)
         return self
 
+    def __repr__(self):
+        return (
+            "<{}.{} "
+            "interval_unit={} "
+            "interval_step={} "
+            "timezone={!r} "
+            "at 0x{:x}>".format(
+                type(self).__module__,
+                type(self).__qualname__,
+                self.interval_unit,
+                self.interval_step,
+                self.timezone,
+                id(self),
+            )
+        )
+
 
 class JobConfig(ConfigElementBase):
     name = None
@@ -232,6 +340,14 @@ class JobConfig(ConfigElementBase):
             repositories[repo_id]
             for repo_id in raw["repositories"]
         ]
+        self.sources = list(raw["sources"])
+
+        try:
+            schedule_cfg = raw["schedule"]
+        except KeyError:
+            pass
+        else:
+            self.schedule = ScheduleConfig.from_raw(schedule_cfg)
 
     def to_raw(self):
         raw = super().to_raw()
@@ -240,6 +356,7 @@ class JobConfig(ConfigElementBase):
             repo.id_
             for repo in self.repositories
         ]
+        raw["sources"] = list(self.sources)
 
         if self.compression_method is not None:
             compression_cfg = raw.setdefault("compression", {})
@@ -247,12 +364,8 @@ class JobConfig(ConfigElementBase):
             if self.compression_level is None:
                 compression_cfg["level"] = self.compression_level
 
-        try:
-            schedule_cfg = raw["schedule"]
-        except KeyError:
-            pass
-        else:
-            self.schedule = ScheduleConfig.from_raw(schedule_cfg)
+        if self.schedule is not None:
+            raw["schedule"] = self.schedule.to_raw()
 
     @classmethod
     def from_raw(self, raw, repositories):
@@ -271,6 +384,10 @@ class JobConfig(ConfigElementBase):
         result.load_from_raw(raw, repositories)
         return result
 
+    def setup_context(self, ctx):
+        ctx.compression_method = self.compression_method
+        ctx.compression_level = self.compression_level
+
 
 class Config(ConfigElementBase):
     def __init__(self):
@@ -279,6 +396,13 @@ class Config(ConfigElementBase):
         self.jobs = {}
 
     def load_from_raw(self, raw):
+        try:
+            schedule_cfg = raw["schedule"]
+        except KeyError:
+            self.schedule = None
+        else:
+            self.schedule = ScheduleConfig.from_raw(schedule_cfg)
+
         for i, repo_raw in enumerate(raw["repository"]):
             if "id" not in repo_raw:
                 raise ValueError(
