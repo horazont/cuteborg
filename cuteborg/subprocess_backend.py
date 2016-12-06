@@ -231,7 +231,14 @@ class LocalSubprocessBackend(backend.Backend):
             env=env,
         )
 
-        yield from proc.wait()
+        try:
+            yield from proc.wait()
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.terminate()
+            yield from proc.wait()
+            raise
+
         if proc.returncode != 0:
             raise subprocess.CalledProcessError(
                 proc.returncode,
@@ -246,16 +253,23 @@ class LocalSubprocessBackend(backend.Backend):
             env=env,
         )
 
-        potential_information = bytearray()
         try:
-            while True:
-                line = yield from proc.stderr.readuntil(b"\r")
-                potential_information.extend(line)
-                line_callback(line.decode())
-        except asyncio.streams.IncompleteReadError as exc:
-            potential_information.extend(exc.partial)
+            potential_information = bytearray()
+            try:
+                while True:
+                    line = yield from proc.stderr.readuntil(b"\r")
+                    potential_information.extend(line)
+                    line_callback(line.decode())
+            except asyncio.streams.IncompleteReadError as exc:
+                potential_information.extend(exc.partial)
 
-        yield from proc.wait()
+            yield from proc.wait()
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.terminate()
+            yield from proc.wait()
+            raise
+
         if proc.returncode != 0:
             raise subprocess.CalledProcessError(
                 proc.returncode,

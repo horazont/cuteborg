@@ -1,17 +1,27 @@
+import ast
 import asyncio
 import contextlib
 import functools
 import logging
+import pathlib
 import signal
+import tempfile
 import uuid
 
 from datetime import datetime
+
+import toml
+
+import xdg.BaseDirectory
 
 import cuteborg.backend
 import cuteborg.subprocess_backend
 import cuteborg.config as config
 
-from . import utils, protocol, wctsleep
+from . import utils, protocol, wctsleep, jobs, devices
+
+if not hasattr(asyncio, "ensure_future"):
+    asyncio.ensure_future = asyncio.async
 
 
 def _schedule_in_interval(now, interval_start, interval_end):
@@ -58,6 +68,23 @@ def cancelling(fut):
             fut.cancel()
 
 
+@contextlib.contextmanager
+def note_job_block(mapping, key, blocker):
+    unset = object()
+    prev = mapping.get(key, unset)
+    mapping[key] = blocker
+    try:
+        yield
+    finally:
+        if prev is unset:
+            try:
+                del mapping[key]
+            except KeyError:
+                pass
+        else:
+            mapping[key] = prev
+
+
 class ServerProtocolEndpoint:
     def __init__(self, logger, scheduler):
         super().__init__()
@@ -65,51 +92,73 @@ class ServerProtocolEndpoint:
         self.scheduler = scheduler
 
     def _handle_status_request(self):
-        self.logger.debug("got status request")
         result = {
-            "schedule": [],
-            "running": [],
+            "jobs": [],
         }
 
-        for ts, (action, *args) in self.scheduler._schedule:
+        for raw in self.scheduler.get_job_status():
+            (type_, *info), job_obj, task_fut, blocker, progress, error = raw
+
             item = {
-                "at": ts,
-                "action": action,
+                "type": type_
             }
 
-            if action == "create_archive":
-                job, repository = args
-                action_info = {
-                    "job_name": job.name,
-                    "repository_id": repository.id_,
-                }
-                item["create_archive"] = action_info
-            elif action == "prune":
-                repository, = args
-                action_info = {
-                    "repository_id": repository.id_,
-                }
-                item["prune"] = action_info
+            if type_ == "create_archive":
+                job_name, repo_id = info
+                item["args"] = {}
+                item["args"]["job"] = job_name
+                item["args"]["repo"] = repo_id
 
-            result["schedule"].append(item)
+            elif type_ == "prune":
+                repo_id, = info
+                item["args"] = {}
+                item["args"]["repo"] = repo_id
 
-        for (action, *args), (run_id, progress) in self.scheduler._active_runs.items():
-            item = {
-                "run_id": str(run_id),
-                "action": action,
-                "args": list(args),
-            }
+            else:
+                item["raw_args"] = list(info)
+
+            if blocker is not None:
+                reason, args = blocker
+                item["blocking"] = {}
+                item["blocking"]["reason"] = reason
+                item["blocking"]["raw_info"] = list(args)
+
+                if reason == "waiting_for_repository_lock":
+                    repo_id, = args
+                    item["blocking"]["struct_info"] = {}
+                    item["blocking"]["struct_info"]["repo"] = repo_id
+
+                elif reason == "sleep_until":
+                    dt, = args
+                    item["blocking"]["struct_info"] = {}
+                    item["blocking"]["struct_info"]["wakeup_at"] = dt
+
+                elif reason == "removable_device":
+                    dev_uuid, = args
+                    item["blocking"]["struct_info"] = {}
+                    item["blocking"]["struct_info"]["device_uuid"] = dev_uuid
 
             if progress is not None:
                 item["progress"] = progress
 
-            result["running"].append(item)
+            if error is not None:
+                msg, timestamp = error
+                item["error"] = {}
+                item["error"]["message"] = msg
+                item["error"]["since"] = timestamp
+
+            item["running"] = task_fut is not None and not task_fut.done()
+
+            result["jobs"].append(item)
 
         return protocol.ToplevelCommand.EXTENDED_REQUEST, result
 
     def handle_request(self, proto, cmd, extra_data):
         if cmd == protocol.ToplevelCommand.STATUS:
             return self._handle_status_request()
+        elif cmd == protocol.ToplevelCommand.RESCHEDULE:
+            self.scheduler._trigger_reload_and_reschedule()
+            return protocol.ToplevelCommand.OKAY, None
 
         self.logger.debug(
             "no way to handle request %r (extra=%r)",
@@ -143,15 +192,59 @@ class Scheduler:
         self._stop_event = asyncio.Event(loop=self.loop)
 
         self._last_runs = {}
-        self._jobs = []
+        self._jobs = {}
+        self._job_tasks = {}
+        self._job_blockers = {}
+        self._job_progress = {}
+        self._job_errors = {}
+
+        self._load_state()
 
         self._rls_pending = False
+        self._shutting_down = False
         self._reload_and_reschedule()
 
         self._endpoint = ServerProtocolEndpoint(
             self.logger.getChild("control"),
             self
         )
+
+    def _save_state(self):
+        cfg_path = pathlib.Path(
+            xdg.BaseDirectory.xdg_config_home
+        ) / "cuteborg" / "scheduler-state.toml"
+
+        self.logger.debug("saving state to %s", cfg_path)
+
+        state = {
+            "last_runs": [
+                {
+                    "key": list(key),
+                    "timestamp": ts,
+                }
+                for key, ts in self._last_runs.items()
+            ]
+        }
+
+        config.toml_to_file(state, cfg_path)
+
+    def _load_state(self):
+        cfg_path = pathlib.Path(
+            xdg.BaseDirectory.xdg_config_home
+        ) / "cuteborg" / "scheduler-state.toml"
+
+        self.logger.debug("loading state from %s", cfg_path)
+        try:
+            with cfg_path.open("r") as f:
+                state = toml.load(f)
+        except OSError as exc:
+            self.logger.warning("failed to load state: %s")
+            return
+
+        self._last_runs = {
+            tuple(item["key"]): item["timestamp"]
+            for item in state.get("last_runs", [])
+        }
 
     def _create_protocol(self):
         self.logger.debug("new connection")
@@ -161,42 +254,106 @@ class Scheduler:
         )
         return proto
 
-    def _note_issue(self, fmt, *args, logger=None, **kwargs):
-        msg = fmt.format(*args, **kwargs)
-        self._issues.append(msg)
-        if logger is None:
-            logger = self.logger
-        logger.error(msg)
-
-    def _reschedule(self, now, schedule, run_key):
-        last_run = self._last_runs.get(run_key)
-
-        if last_run is None:
-            self.logger.debug(
-                "%r: was not run yet",
-                run_key,
+    def _job_main_task_done(self, job_obj, task):
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            try:
+                ex_job_obj, ex_main_task = self._jobs[job_obj.key]
+            except KeyError:
+                # task was cancelled because the job was erased
+                pass
+            else:
+                if ex_job_obj is job_obj and not self._shutting_down:
+                    # task was cancelled for unknown reasons
+                    self.logger.warning(
+                        "unexpected cancellation of main task for job %r",
+                        job_obj,
+                    )
+                # task was cancelled because it was replaced
+        except Exception as exc:
+            self.logger.exception(
+                "main task for job %r failed",
+                job_obj
             )
+            self._job_errors[job_obj.key] = str(exc), datetime.utcnow()
         else:
-            self.logger.debug(
-                "%r: previous run was at %r",
-                run_key,
-                last_run,
+            self.logger.warning(
+                "main task for job %r terminated",
+                job_obj
             )
 
-        next_run = _schedule(
-            now,
-            schedule.interval_step,
-            schedule.interval_unit,
-            last_run,
-        )
+    def _job_task_done(self, job_obj, start_time, task):
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            if not self._shutting_down:
+                self.logger.warning(
+                    "unexpected cancellation of task for job %r",
+                    job_obj,
+                )
+        except:
+            self.logger.exception(
+                "task for job %r failed",
+                job_obj
+            )
+
+        if self._job_tasks[job_obj.key] != task:
+            self.logger.warning(
+                "wtf? inconsistent internal state: "
+                "self._job_tasks[job_obj.key] != task ... "
+                "unsure what to do, continuing for now"
+            )
+
+        del self._job_tasks[job_obj.key]
+
+        try:
+            del self._job_progress[job_obj.key]
+        except KeyError:
+            pass
 
         self.logger.debug(
-            "%r: next run at %s",
-            run_key,
-            next_run,
+            "recording last run of %r as %s",
+            job_obj,
+            start_time
         )
+        self._last_runs[job_obj.key] = start_time
 
-        return next_run
+        job_obj, main_task = self._jobs[job_obj.key]
+        if main_task is None:
+            self.logger.debug(
+                "starting main task for %r now after it has been deferred "
+                "earlier",
+                job_obj
+            )
+            main_task = asyncio.ensure_future(
+                job_obj.run()
+            )
+            self._jobs[job_obj.key] = job_obj, main_task
+
+    def _add_job(self, job_obj):
+        key = job_obj.key
+
+        if key in self._job_tasks:
+            self.logger.debug(
+                "deferring start of main task for job %r, as a task "
+                "is currently running",
+                job_obj
+            )
+            main_task = None
+        else:
+            self.logger.debug("starting main task for job %r", job_obj)
+            main_task = asyncio.ensure_future(job_obj.run())
+            main_task.add_done_callback(
+                functools.partial(
+                    self._job_main_task_done,
+                    job_obj,
+                )
+            )
+
+        self._jobs[key] = (
+            job_obj, main_task
+        )
 
     def _reload_and_reschedule(self):
         self._rls_pending = False
@@ -209,63 +366,82 @@ class Scheduler:
             len(self.config.jobs),
         )
 
-        now = datetime.utcnow()
+        self._repository_locks = {}
 
-        repository_locks = {}
-        schedule = []
+        for job_obj, job_main_task in self._jobs.values():
+            if job_main_task is not None:
+                self.logger.debug("stopping main task of job %s", job_obj.key)
+                job_main_task.cancel()
+
+        self._jobs.clear()
+        self._job_errors.clear()
+
+        new_repositories = set(self.config.repositories)
+        old_repositories = set(self._repository_locks)
+
+        for id_ in (new_repositories - old_repositories):
+            # create locks for added repositories
+            self.logger.debug("repository %r: preparing", id_)
+            self._repository_locks[id_] = asyncio.Lock(loop=self.loop)
+
+        for id_ in (old_repositories - new_repositories):
+            self.logger.debug("repository %r removed -- tearing down", id_)
+            del self._repository_locks[id_]
+
+        # At this point, last_run information needs to be available
 
         for id_, repository in self.config.repositories.items():
-            self.logger.debug("repository %r: preparing", id_)
-            repository_locks[id_] = asyncio.Lock(loop=self.loop)
+            if repository.prune is not None:
+                self.logger.debug(
+                    "repository %r: setting up prune job",
+                    id_
+                )
 
-            # if repository.prune is not None:
-            #     prune = repository.prune
-            #     self.logger.debug("repository %r: uses pruning", id_)
+                instance_logger = self.logger.getChild(
+                    "prune",
+                ).getChild(
+                    str(id_)
+                )
 
-            #     prune_schedule = prune.schedule or self._default_prune_schedule
+                job_obj = jobs.PruneRepository(
+                    instance_logger,
+                    self,
+                    repository.prune,
+                    repository,
+                    repository.prune.schedule or self._default_prune_schedule,
+                )
 
-            #     self.logger.debug("repository %r: uses prune schedule %r",
-            #                       id_, prune_schedule)
-
-            #     next_run = self._reschedule(
-            #         now, prune_schedule,
-            #         ("prune", repository.id_),
-            #     )
-
-            #     schedule.append(
-            #         (next_run, ("prune", repository))
-            #     )
+                self._add_job(job_obj)
 
         for name, job in self.config.jobs.items():
-            self.logger.debug("scheduling job %r", name)
-
-            job_schedule = (job.schedule or self.config.schedule)
-
-            if job_schedule is None:
-                self._note_issue(
-                    "job {!r}: has no schedule!",
-                    name
-                )
-                continue
-
-            self.logger.debug("job %r: uses schedule %r",
-                              name, job_schedule)
-
             for repository in job.repositories:
-                next_run = self._reschedule(
-                    now,
-                    job_schedule,
-                    ("create_archive", job.name, repository.id_),
+                self.logger.debug("job %r, repository %r: preparing",
+                                  name, repository.id_)
+                instance_logger = self.logger.getChild(
+                    "create_archive"
+                ).getChild(
+                    job.name
+                ).getChild(
+                    str(repository.id_)
                 )
 
-                schedule.append(
-                    (next_run, ("create_archive", job, repository))
+                job_obj = jobs.CreateArchive(
+                    instance_logger,
+                    self,
+                    job,
+                    repository,
+                    job.schedule or self.config.schedule,
                 )
 
-        schedule.sort(key=lambda x: x[0])
-        self._repository_locks = repository_locks
-        self._schedule = schedule
-        self.logger.debug("schedule: %s", self._schedule)
+                self._add_job(job_obj)
+
+        self.logger.debug("repository_locks = %r", self._repository_locks)
+        self.logger.debug("jobs = %r", self._jobs)
+        self.logger.debug("job_tasks = %r", self._job_tasks)
+        self.logger.debug("max_slack = %r", self.config.max_slack)
+        self.logger.debug("poll_interval = %r", self.config.poll_interval)
+
+        self.wctsleep.max_slack = self.config.max_slack
 
         self._wakeup_event.set()
 
@@ -291,165 +467,6 @@ class Scheduler:
         )
         self._trigger_reload_and_reschedule()
 
-    def _spawn_done(self, id_, task):
-        try:
-            result = task.result()
-        except asyncio.CancelledError:
-            self.logger.info("task %s: cancelled", id_)
-        except:
-            self.logger.exception("task %s: failed", id_)
-        else:
-            if result is not None:
-                self.logger.info("task %s: returned value: %r", id_, result)
-
-    def _spawn(self, coro, id_=None):
-        task = asyncio.async(coro, loop=self.loop)
-        task.add_done_callback(functools.partial(self._spawn_done, id_))
-        self._running_jobs.append(task)
-        return task
-
-    @asyncio.coroutine
-    def _job_create_archive(self, run_id, job, repository):
-        logger = self.logger.getChild("run").getChild(str(run_id))
-
-        def show_progress(progress):
-            nonlocal state
-            state.clear()
-            if progress is not None:
-                state.update({
-                    key: " ".join(value) if not isinstance(value, int) else value
-                    for key, value in progress.items()
-                })
-            logger.debug("in progress ... %s", state)
-
-        run_key = "create_archive", job.name, repository.id_
-        now = datetime.utcnow()
-
-        logger.debug("running job %r on repository %r",
-                     job.name,
-                     repository.id_)
-
-        logger.debug("locking. now is %s", now)
-        state = {}
-        self._active_runs[run_key] = run_id, state
-        try:
-            archive_name = job.name + "-" + now.isoformat()
-
-            logger.debug("acquiring lock on repository %r", repository.id_)
-            with (yield from self._repository_locks[repository.id_]):
-                logger.debug("lock on repository acquired")
-
-                repo_path = repository.make_repository_path()
-
-                logger.debug(
-                    "job info: "
-                    "\nrepository_path=%r"
-                    "\narchive_name=%r",
-                    repo_path,
-                    archive_name,
-                )
-
-                context = cuteborg.backend.Context()
-                context.progress_callback = show_progress
-                repository.setup_context(context)
-                job.setup_context(context)
-
-                yield from self.backend.create_archive(
-                    repo_path,
-                    archive_name,
-                    job.sources,
-                    context,
-                )
-
-            logger.info("run successful! "
-                        "marking done and rescheduling")
-            self._last_runs[run_key] = now
-            job_schedule = job.schedule or self.config.schedule
-            self._schedule.append(
-                (
-                    self._reschedule(
-                        now,
-                        job_schedule,
-                        ("create_archive", job.name, repository.id_),
-                    ),
-                    ("create_archive", job, repository),
-                )
-            )
-            self._schedule.sort(key=lambda x: x[0])
-            self._wakeup_event.set()
-        finally:
-            logger.debug("releasing lock")
-            del self._active_runs[run_key]
-
-    @asyncio.coroutine
-    def _job_prune(self, run_id, repository):
-        logger = self.logger.getChild("run").getChild(str(run_id))
-
-        run_key = "prune", repository.id_
-        now = datetime.utcnow()
-
-        logger.debug("pruning repository %r",
-                     repository.id_)
-
-        logger.debug("locking. now is %s", now)
-        self._active_runs[run_key] = run_id, None
-        try:
-            logger.debug("acquiring lock on repository %r", repository.id_)
-            with (yield from self._repository_locks[repository.id_]):
-                logger.debug("lock on repository acquired")
-
-                job_names = []
-                for name, job in self.config.jobs.items():
-                    if repository in job.repositories:
-                        job_names.append(name)
-
-                repo_path = repository.make_repository_path()
-                settings = repository.prune.to_kwargs()
-
-                logger.debug(
-                    "job info: "
-                    "\nrepository_path=%r"
-                    "\njobs=%r"
-                    "\nintervals=%r",
-                    repo_path,
-                    job_names,
-                    settings,
-                )
-
-                context = cuteborg.backend.Context()
-                repository.setup_context(context)
-
-                for name in job_names:
-                    prefix = name + "-"
-
-                    yield from self.backend.prune_repository(
-                        repo_path,
-                        context,
-                        prefix,
-                        **settings,
-                    )
-
-            logger.info("run successful! "
-                        "marking done and rescheduling")
-            self._last_runs[run_key] = now
-            prune_schedule = (repository.prune.schedule or
-                              self._default_prune_schedule)
-            self._schedule.append(
-                (
-                    self._reschedule(
-                        now,
-                        prune_schedule,
-                        ("prune", repository.id_),
-                    ),
-                    ("prune", repository),
-                )
-            )
-            self._schedule.sort(key=lambda x: x[0])
-            self._wakeup_event.set()
-        finally:
-            logger.debug("releasing lock")
-            del self._active_runs[run_key]
-
     @asyncio.coroutine
     def _main_loop(self):
         with contextlib.ExitStack() as stack:
@@ -470,90 +487,17 @@ class Scheduler:
                 )
             )
 
-            self.logger.debug("determining wait time")
+            done, pending = yield from asyncio.wait(
+                [
+                    stop_future,
+                    wakeup_future,
+                ],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-            if not self._schedule:
-                self.logger.warning(
-                    "schedule is empty"
-                )
-                timeout = None
-            else:
-                now = datetime.utcnow()
-                next_event_at, _ = self._schedule[0]
-                next_event_in = (next_event_at - now).total_seconds()
-
-                # wake up every five minutes
-                # that’s a workaround for not handling suspend/resume
-                timeout = min(max(next_event_in, 0), 300)
-
-            if timeout is None or timeout > 0:
-                if timeout is None:
-                    self.logger.debug("sleeping until signal")
-                else:
-                    self.logger.debug("sleeping for %.1f seconds", timeout)
-                # wait for timeout
-                done, pending = yield from asyncio.wait(
-                    [stop_future, wakeup_future],
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                    loop=self.loop,
-                )
-
-                if stop_future in done:
-                    self.logger.debug("received stop signal")
-                    return False
-
-                return True
-
-            jobs_to_run = []
-            now = datetime.utcnow()
-            for i, (ts, job) in enumerate(self._schedule):
-                if now >= ts:
-                    jobs_to_run.append(job)
-                else:
-                    self._schedule = self._schedule[i:]
-                    break
-            else:
-                self._schedule.clear()
-
-            self.logger.info("%d jobs ready to run", len(jobs_to_run))
-
-            for action, *args in jobs_to_run:
-                run_id = uuid.uuid4()
-
-                if action == "create_archive":
-                    job, repository = args
-                    run_key = "create_archive", job.name, repository.id_
-                    impl = self._job_create_archive
-                elif action == "prune":
-                    repository, = args
-                    run_key = "prune", repository.id_
-                    impl = self._job_prune
-
-                try:
-                    existing_run_id, _ = self._active_runs[run_key]
-                except KeyError:
-                    pass
-                else:
-                    self.logger.warning(
-                        "SKIPPING job %r on repository %r, as a job (%s) "
-                        "is currently running",
-                        job.name,
-                        repository.id_,
-                        existing_run_id,
-                    )
-                    continue
-
-                self.logger.info("running job %r as %s",
-                                 run_key,
-                                 run_id)
-                self._spawn(
-                    impl(
-                        run_id,
-                        *args,
-                    ),
-                    run_id,
-                )
+            if stop_future in done:
+                self.logger.info("received stop signal (SIGTERM or SIGINT)")
+                return False
 
             return True
 
@@ -631,19 +575,159 @@ class Scheduler:
             while (yield from self._main_loop()):
                 pass
         finally:
+            self.logger.info("saving state")
+            self._save_state()
             self.logger.info("shutting down server")
             server.close()
             self._stop_event.clear()
             self.logger.warning(
-                "waiting for server shutdown -- "
+                "waiting for server and tasks shutdown -- "
                 "if it hangs, send SIGINT/SIGTERM again"
             )
+
+            self._shutting_down = True
+
+            for job_task in self._job_tasks.values():
+                job_task.cancel()
+
+            for _, job_main_task in self._jobs.values():
+                job_main_task.cancel()
+
+            other_futures = list(self._job_tasks.values())
+            other_futures.extend(
+                job_main_task
+                for _, job_main_task in self._jobs.values()
+            )
+            other_futures.append(
+                server.wait_closed()
+            )
+            other_futures.append(
+                self.wctsleep.cancel_and_wait()
+            )
+
+            other_futures_fut = asyncio.ensure_future(
+                asyncio.wait(
+                    other_futures,
+                ),
+            )
+
             done, pending = yield from asyncio.wait(
                 [
-                    server.wait_closed(),
                     self._stop_event.wait(),
+                    other_futures_fut,
                 ],
-                return_when=asyncio.FIRST_COMPLETED)
+                return_when=asyncio.FIRST_COMPLETED
+            )
 
             for fut in pending:
                 fut.cancel()
+
+    def get_last_run(self, key):
+        return self._last_runs.get(key)
+
+    @asyncio.coroutine
+    def sleep_until(self, job_obj, dt):
+        with note_job_block(
+                self._job_blockers,
+                job_obj.key,
+                (
+                    "sleep_until",
+                    (dt, ),
+                )):
+            yield from self.wctsleep.sleep_until(dt)
+
+    @asyncio.coroutine
+    def execute_job(self, job_obj, **kwargs):
+        key = job_obj.key
+        task = asyncio.ensure_future(job_obj.exec(**kwargs))
+        self._job_tasks[key] = task
+        task.add_done_callback(
+            functools.partial(
+                self._job_task_done,
+                job_obj,
+                datetime.utcnow()
+            )
+        )
+        yield from asyncio.shield(task)
+
+    @asyncio.coroutine
+    def _wait_for_remote_repository(self, logger, job_key, remote_repo):
+        return remote_repo.make_repository_path()
+
+    @asyncio.coroutine
+    def _wait_for_removable_device(self, logger, job_key, local_repo):
+        problem_known = None
+        while True:
+            try:
+                mount_path = yield from devices.wait_for_mounted(
+                    logger,
+                    local_repo.removable_device_uuid,
+                    self.config.poll_interval,
+                    crypto_passphrase=local_repo.crypto_passphrase
+                )
+                break
+            except devices.EncryptedDeviceWithoutPassphrase as exc:
+                if problem_known is not type(exc):
+                    self._job_errors[job_key] = (
+                        str(exc),
+                        datetime.utcnow(),
+                    )
+                problem_known = type(exc)
+
+            yield from asyncio.sleep(self.config.poll_interval)
+
+        logger.debug(
+            "device is mounted at %r",
+            mount_path
+        )
+        return mount_path + local_repo.make_repository_path()
+
+    @asyncio.coroutine
+    def wait_for_repository_storage(self, job_obj, repository_cfg):
+        if isinstance(repository_cfg, config.RemoteRepositoryConfig):
+            return (yield from self._wait_for_remote_repository(
+                job_obj.logger,
+                job_obj.key,
+                repository_cfg
+            ))
+        elif isinstance(repository_cfg, config.LocalRepositoryConfig):
+            if repository_cfg.removable_device_uuid is not None:
+                with note_job_block(
+                        self._job_blockers,
+                        job_obj.key,
+                        (
+                            "removable_device",
+                            (repository_cfg.removable_device_uuid, ),
+                        )):
+                    return (yield from self._wait_for_removable_device(
+                        job_obj.logger,
+                        job_obj.key,
+                        repository_cfg
+                    ))
+            else:
+                return repository_cfg.make_repository_path()
+
+    @asyncio.coroutine
+    def lock_repository(self, job_obj, id_):
+        with note_job_block(
+                self._job_blockers,
+                job_obj.key,
+                (
+                    "waiting_for_repository_lock",
+                    (id_,)
+                )):
+            return (yield from self._repository_locks[id_])
+
+    def get_job_status(self):
+        for key, (job_obj, job_main_task) in self._jobs.items():
+            yield (
+                key,
+                job_obj,
+                self._job_tasks.get(key),
+                self._job_blockers.get(key),
+                self._job_progress.get(key),
+                self._job_errors.get(key),
+            )
+
+    def set_job_progress(self, job_obj, progress):
+        self._job_progress[job_obj.key] = progress

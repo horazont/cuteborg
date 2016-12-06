@@ -37,17 +37,6 @@ def load_config():
         return {}
 
 
-def load_state():
-    cfg_path = pathlib.Path(
-        xdg.BaseDirectory.xdg_config_home
-    ) / "cuteborg" / "state.toml"
-    try:
-        with cfg_path.open("r") as f:
-            return toml.load(f)
-    except OSError:
-        return {}
-
-
 class ConfigElementBase(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def load_from_raw(self, raw):
@@ -180,7 +169,7 @@ class RepositoryConfig(ConfigElementBase):
 class LocalRepositoryConfig(RepositoryConfig):
     path = None
     removable_device_uuid = None
-    crypto_device_uuid = None
+    crypto_enabled = False
     crypto_passphrase = None
 
     def load_from_raw(self, raw):
@@ -195,16 +184,17 @@ class LocalRepositoryConfig(RepositoryConfig):
         try:
             removable_cfg = local_cfg["removable"]
         except KeyError:
-            pass
+            self.removable_device_uuid = None
         else:
             self.removable_device_uuid = removable_cfg["device_uuid"]
 
         try:
             crypto_cfg = local_cfg["crypto"]
         except KeyError:
-            pass
+            self.crypto_enabled = False
+            self.crypto_passphrase = None
         else:
-            self.crypto_device_uuid = crypto_cfg["device_uuid"]
+            self.crypto_enabeld = crypto_cfg.get("enabled", True)
             self.crypto_passphrase = crypto_cfg.get("passphrase")
 
     def to_raw(self):
@@ -216,11 +206,10 @@ class LocalRepositoryConfig(RepositoryConfig):
             removable_cfg = raw["local"].setdefault("removable")
             removable_cfg["device_uuid"] = self.removable_device_uuid
 
-        if self.crypto_device_uuid is not None:
+        if self.crypto_enabled:
             crypto_cfg = raw["local"].setdefault("crypto")
-            crypto_cfg["device_uuid"] = self.crypto_device_uuid
-            if self.crypto_passphrase is not None:
-                crypto_cfg["passphrase"] = self.crypto_passphrase
+            crypto_cfg["enabled"] = self.crypto_enabled
+            crypto_cfg["passphrase"] = self.crypto_passphrase
 
         return raw
 
@@ -390,6 +379,9 @@ class JobConfig(ConfigElementBase):
 
 
 class Config(ConfigElementBase):
+    poll_interval = 60
+    max_slack = 60
+
     def __init__(self):
         super().__init__()
         self.repositories = {}
@@ -433,6 +425,9 @@ class Config(ConfigElementBase):
 
             self.jobs[job.name] = job
 
+        self.poll_interval = raw.get("poll_interval", 60)
+        self.max_slack = raw.get("max_slack", 60)
+
     def to_raw(self):
         raw = super().to_raw()
         raw["repository"] = [
@@ -445,6 +440,9 @@ class Config(ConfigElementBase):
             for job in self.jobs.values()
         ]
 
+        raw["poll_interval"] = self.poll_interval
+        raw["max_slack"] = self.max_slack
+
     @classmethod
     def from_raw(cls, raw):
         self = cls()
@@ -452,48 +450,30 @@ class Config(ConfigElementBase):
         return self
 
 
+def toml_to_file(data, path):
+    with tempfile.NamedTemporaryFile(
+            "w",
+            dir=str(path.parent),
+            delete=False) as temp:
+        tempfile_path = path.parent / temp.name
+        try:
+            toml.dump(data, temp)
+        except:
+            try:
+                tempfile_path.unlink()
+            except OSError:
+                # ignore, we want to re-raise the original problem instead
+                pass
+            raise
+
+        tempfile_path.rename(path)
+
+
 def save_config(cfg):
     cfg_path = pathlib.Path(
         xdg.BaseDirectory.xdg_config_home
     ) / "cuteborg" / "config.toml"
-    with tempfile.NamedTemporaryFile(
-            "w",
-            dir=str(cfg_path.parent),
-            delete=False) as temp:
-        tempfile_path = cfg_path.parent / temp.name
-        try:
-            toml.dump(cfg, temp)
-        except:
-            try:
-                tempfile_path.unlink()
-            except OSError:
-                # ignore, we want to re-raise the original problem instead
-                pass
-            raise
-
-        tempfile_path.rename(cfg_path)
-
-
-def save_state(cfg):
-    cfg_path = pathlib.Path(
-        xdg.BaseDirectory.xdg_config_home
-    ) / "cuteborg" / "state.toml"
-    with tempfile.NamedTemporaryFile(
-            "w",
-            dir=str(cfg_path.parent),
-            delete=False) as temp:
-        tempfile_path = cfg_path.parent / temp.name
-        try:
-            toml.dump(cfg, temp)
-        except:
-            try:
-                tempfile_path.unlink()
-            except OSError:
-                # ignore, we want to re-raise the original problem instead
-                pass
-            raise
-
-        tempfile_path.rename(cfg_path)
+    toml_to_file(cfg, cfg_path)
 
 
 def find_repository_by_id(repositories, id_):

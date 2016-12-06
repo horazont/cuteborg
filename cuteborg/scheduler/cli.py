@@ -2,12 +2,15 @@ import argparse
 import asyncio
 import logging
 import pathlib
+import pprint
 import sys
+
+from datetime import datetime
 
 import xdg.BaseDirectory
 
 from .. import utils
-from . import core, status
+from . import core, status, protocol
 
 
 @asyncio.coroutine
@@ -16,54 +19,148 @@ def cmd_run(loop, args):
     return (yield from scheduler.main())
 
 
+def _format_value(value):
+    if isinstance(value, datetime):
+        return str(value)
+    return repr(value)
+
+
+def _format_dict(d):
+    return " ".join(
+        "{}={}".format(key, _format_value(value))
+        for key, value
+        in sorted(d.items())
+    )
+
+
+def _format_status_row(item):
+    reason_map = {
+        "waiting_for_repository_lock": "repolock",
+        "removable_device": "device",
+        "sleep_until": "scheduled",
+    }
+
+    try:
+        args = item["args"]
+    except KeyError:
+        args = str(item["raw_args"])
+    else:
+        args = _format_dict(args)
+
+    state = "??"
+    if item["running"] and not item.get("blocking"):
+        state = "run"
+    elif item.get("error"):
+        state = "error"
+    elif item.get("blocking"):
+        state = "wait"
+
+    status_parts = []
+    try:
+        blocking_info = item["blocking"]
+    except KeyError:
+        pass
+    else:
+        status_parts.append(
+            reason_map.get(blocking_info["reason"],
+                           blocking_info["reason"])
+        )
+
+        try:
+            struct_info = blocking_info["struct_info"]
+        except KeyError:
+            status_parts.append(
+                str(blocking_info["raw_info"])
+            )
+        else:
+            status_parts.append(
+                _format_dict(struct_info)
+            )
+
+    try:
+        error_info = item["error"]
+    except KeyError:
+        pass
+    else:
+        status_parts.append("error since {}: {}".format(
+            error_info["since"],
+            error_info["message"],
+        ))
+
+    try:
+        progress_info = item["progress"]
+    except KeyError:
+        pass
+    else:
+        status_parts.append("progress")
+        status_parts.append(
+            _format_dict(progress_info)
+        )
+
+    return (
+        item["type"],
+        args,
+        state,
+        " ".join(status_parts),
+    )
+
+
 @asyncio.coroutine
 def cmd_status(loop, args):
     data = yield from status.get_status(loop, args.socket_path)
 
-    headers = [
-        "run at",
-        "action",
-        "args",
-    ]
-    rows = [
-        (
-            str(item["at"]),
-            item["action"],
-            " ".join(
-                "{}={!r}".format(key, value)
-                for key, value
-                in sorted(item[item["action"]].items())
-            )
-        )
-        for item in data["schedule"]
-    ]
-
-    print("upcoming jobs: {}".format(len(data["schedule"])))
-    utils.print_table(headers, rows)
-
-    print()
-    print("running jobs: {}".format(len(data["running"])))
+    logging.getLogger("cuteborg.scheduler").debug(
+        "\n%s",
+        pprint.pformat(data),
+    )
 
     headers = [
-        "run_id",
-        "action",
+        "type",
         "args",
-        "progress",
+        "state",
+        "status",
     ]
-    rows = [
-        (
-            item["run_id"],
-            item["action"],
-            str(item["args"]),
-            " ".join(
-                "{}={!r}".format(key, value)
-                for key, value
-                in sorted(item["progress"].items())
-            ) if "progress" in item else ""
-        )
-        for item in data["running"]
-    ]
+
+    rows = list(map(_format_status_row, data["jobs"]))
+
+    print("jobs: {}".format(len(data["jobs"])))
     utils.print_table(headers, rows)
+
+
+@asyncio.coroutine
+def cmd_reload(loop, args):
+    logger = logging.getLogger("cuteborg.scheduler")
+
+    try:
+        endpoint = yield from asyncio.wait_for(
+            protocol.test_and_get_socket(
+                loop,
+                logger,
+                args.socket_path,
+            ),
+            timeout=5
+        )
+    except (asyncio.TimeoutError, FileNotFoundError, ConnectionError) as exc:
+        msg = str(exc)
+        if isinstance(exc, asyncio.TimeoutError):
+            msg = "timeout"
+        logger.error("failed to connect to scheduler at %r: %s",
+                     str(args.socket_path),
+                     msg)
+        raise RuntimeError(
+            "failed to connect to scheduler"
+        )
+
+    response, data = yield from endpoint.request(
+        protocol.ToplevelCommand.RESCHEDULE
+    )
+
+    if response == protocol.ToplevelCommand.OKAY:
+        logger.info("reload triggered successfully")
+        return 0
+    else:
+        logger.error("could not trigger reload")
+        return 2
 
 
 def main():
@@ -98,6 +195,13 @@ def main():
         help="Connect to a running scheduler and show the status"
     )
     subparser.set_defaults(func=cmd_status)
+
+    subparser = subparsers.add_parser(
+        "reload",
+        help="Connect to a running scheduler and ask it to schedule a "
+        "reload and reschedule"
+    )
+    subparser.set_defaults(func=cmd_reload)
 
     args = parser.parse_args()
 

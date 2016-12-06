@@ -3,6 +3,8 @@ import asyncio
 
 from datetime import datetime
 
+import cuteborg.backend
+
 from . import utils
 
 
@@ -63,12 +65,93 @@ class Job(metaclass=abc.ABCMeta):
         """
 
 
-class CreateArchive(Job):
-    def __init__(self, logger, scheduler, job_cfg, repository_cfg):
+class PeriodicRepositoryJob(Job):
+    def __init__(self, logger, scheduler, repository_cfg, schedule):
         super().__init__(logger, scheduler)
-        self.job_cfg = job_cfg
         self.repository_cfg = repository_cfg
-        self.schedule = job_cfg.schedule or scheduler.config.schedule
+        self.schedule = schedule
+
+    @asyncio.coroutine
+    def exec(self, **kwargs):
+        self.logger.debug("locking repository %r", self.repository_cfg.id_)
+        with (yield from self.scheduler.lock_repository(
+                self,
+                self.repository_cfg.id_)):
+            self.logger.debug("locked repository %r", self.repository_cfg.id_)
+            yield from self._exec(**kwargs)
+
+    @asyncio.coroutine
+    def run(self):
+        while True:
+            last_run = self.scheduler.get_last_run(self.key)
+            if last_run is None:
+                self.logger.debug("job was not run yet")
+            else:
+                self.logger.debug("last run was at %r", last_run)
+
+            next_run = _schedule_next(
+                datetime.utcnow(),
+                self.schedule,
+                last_run,
+            )
+
+            self.logger.debug("next run is at %s", next_run)
+            yield from self.scheduler.sleep_until(self, next_run)
+
+            # waits until the storage of the repository is reachable
+            repo_path = yield from self.scheduler.wait_for_repository_storage(
+                self,
+                self.repository_cfg
+            )
+
+            self.logger.debug(
+                "repository is at %r",
+                repo_path,
+            )
+
+            yield from self.scheduler.execute_job(self, repo_path=repo_path)
+
+
+class PruneRepository(PeriodicRepositoryJob):
+    def __init__(self, logger, scheduler, prune_cfg, repository_cfg, schedule):
+        super().__init__(logger, scheduler, repository_cfg, schedule)
+        self.prune_cfg = prune_cfg
+
+    @property
+    def key(self):
+        return ("prune",
+                self.repository_cfg.id_)
+
+    @asyncio.coroutine
+    def _exec(self, repo_path):
+        job_names = []
+        for name, job in self.scheduler.config.jobs.items():
+            if self.repository_cfg in job.repositories:
+                job_names.append(name)
+
+        settings = self.repository_cfg.prune.to_kwargs()
+
+        context = cuteborg.backend.Context()
+        self.repository_cfg.setup_context(context)
+
+        for name in job_names:
+            prefix = name + "-"
+
+            self.logger.debug(
+                "pruning archives starting with %r", prefix
+            )
+            yield from self.scheduler.backend.prune_repository(
+                repo_path,
+                context,
+                prefix,
+                **settings,
+            )
+
+
+class CreateArchive(PeriodicRepositoryJob):
+    def __init__(self, logger, scheduler, job_cfg, repository_cfg, schedule):
+        super().__init__(logger, scheduler, repository_cfg, schedule)
+        self.job_cfg = job_cfg
 
     @property
     def key(self):
@@ -76,22 +159,35 @@ class CreateArchive(Job):
                 self.job_cfg.name,
                 self.repository_cfg.id_)
 
-    @asyncio.coroutine
-    def exec(self, logger):
-        pass
-
-    @asyncio.coroutine
-    def run(self):
-        last_run = self.scheduler.get_last_run(self.key)
-
-        while True:
-            next_run = _schedule_next(
-                datetime.utcnow(),
-                self.schedule,
-                last_run,
+    def _update_progress(self, progress):
+        if progress is not None:
+            self.scheduler.set_job_progress(
+                self,
+                {
+                    key: (" ".join(value)
+                          if not isinstance(value, int)
+                          else value)
+                    for key, value in progress.items()
+                }
             )
+        else:
+            self.scheduler.set_job_progress(self, None)
 
-            yield from self.scheduler.sleep_until(next_run)
+    @asyncio.coroutine
+    def _exec(self, repo_path):
+        self.logger.debug("starting job")
+        now = datetime.utcnow()
 
-            last_run = next_run
-            yield from self.scheduler.execute_job(self)
+        archive_name = self.job_cfg.name + "-" + now.isoformat()
+
+        context = cuteborg.backend.Context()
+        context.progress_callback = self._update_progress
+        self.repository_cfg.setup_context(context)
+        self.job_cfg.setup_context(context)
+
+        yield from self.scheduler.backend.create_archive(
+            repo_path,
+            archive_name,
+            self.job_cfg.sources,
+            context,
+        )

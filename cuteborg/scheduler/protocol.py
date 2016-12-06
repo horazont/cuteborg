@@ -117,7 +117,7 @@ class ControlProtocol(asyncio.Protocol):
     def _error(self):
         if hasattr(self, "_transport"):
             self.send(
-                ToplevelCommand.ERROR.value,
+                ToplevelCommand.ERROR,
             )
             self._transport.close()
 
