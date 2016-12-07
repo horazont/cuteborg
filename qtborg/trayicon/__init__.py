@@ -1,4 +1,6 @@
 import asyncio
+import enum
+import itertools
 import pathlib
 import signal
 
@@ -18,10 +20,51 @@ from .ui_main import Ui_StatusWindow
 SortRole = Qt.Qt.UserRole
 
 
-def _load_icon(name):
+def _load_pixmap(name):
     for p in __path__:
         filename = pathlib.Path(p) / "data" / name
-        return Qt.QIcon(Qt.QPixmap(str(filename)))
+        pixmap = Qt.QPixmap(str(filename))
+        if pixmap.isNull():
+            continue
+        return pixmap
+    raise FileNotFoundError("icon {!r} not found".format(name))
+
+
+def _load_icon(name):
+    return Qt.QIcon(_load_pixmap(name))
+
+
+def _compose_icon(bottom_left=None, top_right=None):
+    base = _load_pixmap("base.png")
+    if bottom_left is None and top_right is None:
+        return Qt.QIcon(base)
+
+    if bottom_left is not None:
+        bottom_left = _load_pixmap(bottom_left).toImage()
+    if top_right is not None:
+        top_right = _load_pixmap(top_right).toImage()
+
+    base = base.toImage()
+    painter = Qt.QPainter()
+    painter.begin(base)
+
+    if bottom_left is not None:
+        y = base.height() - bottom_left.height()
+        painter.drawImage(
+            Qt.QPoint(0, y),
+            bottom_left
+        )
+
+    if top_right is not None:
+        x = base.width() - top_right.width()
+        painter.drawImage(
+            Qt.QPoint(x, 0),
+            top_right
+        )
+
+    painter.end()
+
+    return Qt.QIcon(Qt.QPixmap.fromImage(base))
 
 
 CREATE_ARCHIVE_BASE_TEMPLATE = (
@@ -162,6 +205,7 @@ class JobsModel(Qt.QAbstractTableModel):
 
             if key in abandoned_keys:
                 indices_to_delete.append(i)
+                self.known_keys.discard(key)
                 continue
 
             try:
@@ -303,6 +347,13 @@ class JobsModel(Qt.QAbstractTableModel):
         return Qt.Qt.ItemIsEnabled | Qt.Qt.ItemIsSelectable
 
 
+class ErrorCondition(enum.Enum):
+    SCHEDULER_NOT_RUNNING = "The scheduler is not running!"
+    REMOVABLE_DEVICE_MISSING = \
+        "A removable device ({}) must be inserted for backup jobs to continue."
+    OTHER_ERROR = "Error: {}"
+
+
 class Main(Qt.QMainWindow):
     def __init__(self, loop, logger, socket_path):
         super().__init__()
@@ -315,15 +366,24 @@ class Main(Qt.QMainWindow):
         self.trayicon.activated.connect(
             self._tray_icon_activated
         )
+        self.trayicon.installEventFilter(self)
 
         self.icons = {
-            "blue": _load_icon("bullet_blue.png"),
-            "orange": _load_icon("bullet_orange.png"),
-            "red": _load_icon("bullet_red.png"),
-            "": Qt.QIcon(Qt.QPixmap()),
+            (colour, flag): _compose_icon(
+                flag and "bullet_{}.png".format(flag),
+                colour and "bullet_{}.png".format(colour),
+            )
+            for colour, flag in itertools.product(
+                (None, "blue", "orange", "red"),
+                (None, "error"))
         }
+
+        self._connected = False
+        self._jobs = []
+        self._error_conditions = set()
+        self._curr_icon = None, "error"
         self.trayicon.setIcon(
-            self.icons["blue"],
+            self.icons[self._curr_icon],
         )
         self.socket_path = socket_path
         self.loop = loop
@@ -412,24 +472,73 @@ class Main(Qt.QMainWindow):
     def _blink_task(self):
         try:
             while True:
-                yield from asyncio.sleep(1)
-                self.trayicon.setIcon(self.icons[""])
-                yield from asyncio.sleep(1)
+                yield from asyncio.sleep(1.5)
+                self.trayicon.setIcon(self.icons[None, None])
+                yield from asyncio.sleep(0.5)
                 self.trayicon.setIcon(self.icons[self._curr_icon])
         except asyncio.CancelledError:
             self.trayicon.setIcon(self.icons[self._curr_icon])
 
     def _update_jobs(self, jobs):
-        next_scheduling_event = None
-        nrunning = 0
-        any_failed = False
-        any_warning = False
+        self._jobs = jobs
+        self.jobs_model.update_jobs(jobs)
 
+    def _set_error_condition(self, condition, data=()):
+        key = condition, data
+        if key in self._error_conditions:
+            return
+
+        self._error_conditions.add(key)
+
+        if Qt.QSystemTrayIcon.supportsMessages():
+            self.trayicon.showMessage(
+                "CuteBorg error",
+                condition.value.format(*data),
+                Qt.QSystemTrayIcon.Warning,
+            )
+
+    def _clear_error_condition(self, condition, data=None):
+        self._error_conditions.discard((condition, data))
+
+    def _update_error_conditions_from_jobs(self):
+        current_conditions = set()
+
+        for job in self._jobs:
+            try:
+                error_info = job["error"]
+            except KeyError:
+                pass
+            else:
+                current_conditions.add(
+                    (ErrorCondition.OTHER_ERROR,
+                     (error_info["message"],))
+                )
+                continue
+
+            try:
+                blocking_info = job["blocking"]
+            except KeyError:
+                pass
+            else:
+                if blocking_info["reason"] == "removable_device":
+                    current_conditions.add(
+                        (ErrorCondition.REMOVABLE_DEVICE_MISSING,
+                         (blocking_info["struct_info"]["device_uuid"],))
+                    )
+
+        for key in set(self._error_conditions):
+            if key not in current_conditions:
+                self._clear_error_condition(*key)
+
+        for key in current_conditions:
+            self._set_error_condition(*key)
+
+    def _generate_tooltip_from_jobs(self):
         job_table = []
-
+        nrunning = 0
         now = datetime.utcnow()
 
-        for job in jobs:
+        for job in self._jobs:
             if job["running"]:
                 nrunning += 1
 
@@ -464,23 +573,38 @@ class Main(Qt.QMainWindow):
                         )
                     )
 
-            try:
-                blocking_info = job["blocking"]
-            except KeyError:
-                pass
-            else:
-                try:
-                    wakeup_at = blocking_info["struct_info"]["wakeup_at"]
-                except KeyError:
-                    pass
+        return "<p>running jobs: {}</p>{}".format(
+            nrunning,
+            ("<table><tr><th>Task</th><th>Job name</th><th>Repository</th><th>Status</th></tr>{}</table>".format("".join(job_table)))
+            if job_table else ""
+        )
+
+    def eventFilter(self, object_, ev):
+        if object_ == self.trayicon:
+            if ev.type() == Qt.QEvent.ToolTip:
+                if self._connected:
+                    Qt.QToolTip.showText(
+                        ev.globalPos(),
+                        self._generate_tooltip_from_jobs(),
+                    )
                 else:
-                    if next_scheduling_event is not None:
-                        next_scheduling_event = min(
-                            wakeup_at,
-                            next_scheduling_event,
-                        )
-                    else:
-                        next_scheduling_event = wakeup_at
+                    Qt.QToolTip.showText(
+                        ev.globalPos(),
+                        "<strong>Scheduler not running!</strong>"
+                    )
+                return True
+            return False
+        else:
+            return False
+
+    def _update_trayicon_from_jobs(self):
+        nrunning = False
+        any_failed = False
+        any_warning = False
+
+        for job in self._jobs:
+            if job["running"]:
+                nrunning += 1
 
             any_failed = (
                 any_failed or
@@ -493,24 +617,26 @@ class Main(Qt.QMainWindow):
                 job.get("blocking", {}).get("reason") == "removable_device"
             )
 
-        self.trayicon.setToolTip(
-            "<p>running jobs: {}</p>{}".format(
-                nrunning,
-                ("<table><tr><th>Task</th><th>Job name</th><th>Repository</th><th>Status</th></tr>{}</table>".format("".join(job_table)))
-                if job_table else ""
-            )
-        )
-
         if any_failed:
-            self._curr_icon = "red"
+            self._curr_icon = "red", None
         elif any_warning:
-            self._curr_icon = "orange"
+            self._curr_icon = "orange", None
         else:
-            self._curr_icon = "blue"
+            self._curr_icon = "blue", None
 
         if nrunning and self.blink_task is None:
+            self.trayicon.setIcon(self.icons[self._curr_icon])
+
             self.blink_task = asyncio.ensure_future(
                 self._blink_task()
+            )
+
+            def clear_task(fut):
+                self.blink_task = None
+                fut.result()
+
+            self.blink_task.add_done_callback(
+                clear_task
             )
         elif not nrunning and self.blink_task is not None:
             self.blink_task.cancel()
@@ -518,8 +644,6 @@ class Main(Qt.QMainWindow):
 
         if not nrunning:
             self.trayicon.setIcon(self.icons[self._curr_icon])
-
-        self.jobs_model.update_jobs(jobs)
 
     @asyncio.coroutine
     def _get_connection(self):
@@ -544,7 +668,9 @@ class Main(Qt.QMainWindow):
                                   str(self.socket_path),
                                   msg)
             self._update_jobs({})
-            yield from asyncio.sleep(30)
+            yield from asyncio.sleep(10)
+
+        self._connected = True
 
         response, data = yield from endpoint.request(
             cuteborg.scheduler.protocol.ToplevelCommand.STATUS,
@@ -555,60 +681,63 @@ class Main(Qt.QMainWindow):
         return endpoint
 
     @asyncio.coroutine
-    def run(self):
-        self.trayicon.show()
-        stop_future = asyncio.ensure_future(self.stop_event.wait())
+    def _update_loop(self, stop_future):
+        self._curr_icon = None, "error"
+        if self._connected:
+            self._set_error_condition(
+                ErrorCondition.SCHEDULER_NOT_RUNNING
+            )
+        self._connected = False
+        self.trayicon.setIcon(self.icons[self._curr_icon])
+
+        self.logger.debug("attempting connection ...")
+
+        conn_future = asyncio.ensure_future(self._get_connection())
+        done, pending = yield from asyncio.wait(
+            [
+                stop_future,
+                conn_future,
+            ],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        for fut in pending:
+            if fut != stop_future:
+                fut.cancel()
+
+        if conn_future in done:
+            endpoint = conn_future.result()
+        else:
+            return
+
+        self.logger.debug("connection established!")
 
         while True:
-            conn_future = asyncio.ensure_future(self._get_connection())
-            done, pending = yield from asyncio.wait(
-                [
-                    stop_future,
-                    conn_future,
-                ],
-                return_when=asyncio.FIRST_COMPLETED
-            )
+            try:
+                conn_future = asyncio.ensure_future(
+                    endpoint.poll_start()
+                )
 
-            for fut in pending:
-                if fut != stop_future:
-                    fut.cancel()
+                done, pending = yield from asyncio.wait(
+                    [
+                        conn_future,
+                        stop_future,
+                    ],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
 
-            if conn_future in done:
-                endpoint = conn_future.result()
-            else:
-                return
+                for fut in pending:
+                    if fut != stop_future:
+                        fut.cancel()
 
-            while True:
-                try:
-                    conn_future = asyncio.ensure_future(
-                        endpoint.poll_start()
-                    )
-
-                    done, pending = yield from asyncio.wait(
-                        [
-                            conn_future,
-                            stop_future,
-                        ],
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-
-                    for fut in pending:
-                        if fut != stop_future:
-                            fut.cancel()
-
-                    if conn_future in done:
-                        response, data = conn_future.result()
-                    else:
-                        return
-
-                except ConnectionError as exc:
-                    self.logger.error(
-                        "connection to scheduler broke: %s",
-                        exc
-                    )
-                    break
+                if conn_future in done:
+                    response, data = conn_future.result()
+                else:
+                    return
 
                 self._update_jobs(data["jobs"])
+                self._update_trayicon_from_jobs()
+                self._update_error_conditions_from_jobs()
 
                 conn_future = asyncio.ensure_future(
                     endpoint.poll_finalise()
@@ -630,3 +759,17 @@ class Main(Qt.QMainWindow):
                     conn_future.result()
                 else:
                     return
+            except ConnectionError as exc:
+                self.logger.error(
+                    "connection to scheduler broke: %s",
+                    exc
+                )
+                break
+
+    @asyncio.coroutine
+    def run(self):
+        self.trayicon.show()
+        stop_future = asyncio.ensure_future(self.stop_event.wait())
+
+        while True:
+            yield from self._update_loop(stop_future)

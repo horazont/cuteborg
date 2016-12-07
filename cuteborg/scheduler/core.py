@@ -92,9 +92,11 @@ class ServerProtocolEndpoint:
         super().__init__()
         self.logger = logger
         self.scheduler = scheduler
+        self.poll_pending = False
         self.poll_futures = []
 
-    def notify_poll(self):
+    def _delayed_notify_poll(self):
+        self.poll_pending = False
         self.logger.debug("notifying pollers")
 
         for fut in self.poll_futures:
@@ -103,6 +105,16 @@ class ServerProtocolEndpoint:
 
             fut.set_result(None)
         self.poll_futures.clear()
+
+    def notify_poll(self):
+        if self.poll_pending:
+            return
+
+        self.poll_pending = True
+        asyncio.get_event_loop().call_later(
+            0.1,
+            self._delayed_notify_poll,
+        )
 
     def _handle_status_request(self):
         result = {
@@ -719,6 +731,9 @@ class Scheduler:
                 problem_known = type(exc)
 
             yield from asyncio.sleep(self.config.poll_interval)
+
+        # clear errors
+        self._job_errors.pop(job_key, None)
 
         logger.debug(
             "device is mounted at %r",
