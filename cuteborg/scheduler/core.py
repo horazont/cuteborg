@@ -69,10 +69,11 @@ def cancelling(fut):
 
 
 @contextlib.contextmanager
-def note_job_block(mapping, key, blocker):
+def note_job_block(mapping, key, blocker, notifier):
     unset = object()
     prev = mapping.get(key, unset)
     mapping[key] = blocker
+    notifier()
     try:
         yield
     finally:
@@ -83,6 +84,7 @@ def note_job_block(mapping, key, blocker):
                 pass
         else:
             mapping[key] = prev
+        notifier()
 
 
 class ServerProtocolEndpoint:
@@ -90,6 +92,17 @@ class ServerProtocolEndpoint:
         super().__init__()
         self.logger = logger
         self.scheduler = scheduler
+        self.poll_futures = []
+
+    def notify_poll(self):
+        self.logger.debug("notifying pollers")
+
+        for fut in self.poll_futures:
+            if fut.done():
+                continue
+
+            fut.set_result(None)
+        self.poll_futures.clear()
 
     def _handle_status_request(self):
         result = {
@@ -97,25 +110,37 @@ class ServerProtocolEndpoint:
         }
 
         for raw in self.scheduler.get_job_status():
-            (type_, *info), job_obj, task_fut, blocker, progress, error = raw
+            ((type_, *info),
+             job_obj,
+             task_fut,
+             blocker,
+             progress,
+             error,
+             last_run) = raw
 
             item = {
-                "type": type_
+                "type": type_,
+                "last_run": last_run,
             }
 
             if type_ == "create_archive":
                 job_name, repo_id = info
                 item["args"] = {}
                 item["args"]["job"] = job_name
-                item["args"]["repo"] = repo_id
+                item["args"]["repo"] = {
+                    "id": repo_id,
+                    "name": self.scheduler.config.repositories[repo_id].name
+                }
 
             elif type_ == "prune":
                 repo_id, = info
                 item["args"] = {}
-                item["args"]["repo"] = repo_id
+                item["args"]["repo"] = {
+                    "id": repo_id,
+                    "name": self.scheduler.config.repositories[repo_id].name
+                }
 
-            else:
-                item["raw_args"] = list(info)
+            item["raw_args"] = list(info)
 
             if blocker is not None:
                 reason, args = blocker
@@ -126,7 +151,10 @@ class ServerProtocolEndpoint:
                 if reason == "waiting_for_repository_lock":
                     repo_id, = args
                     item["blocking"]["struct_info"] = {}
-                    item["blocking"]["struct_info"]["repo"] = repo_id
+                    item["blocking"]["struct_info"]["repo"] = {
+                        "id": repo_id,
+                        "name": self.scheduler.config.repositories[repo_id].name
+                    }
 
                 elif reason == "sleep_until":
                     dt, = args
@@ -153,12 +181,24 @@ class ServerProtocolEndpoint:
 
         return protocol.ToplevelCommand.EXTENDED_REQUEST, result
 
+    def _send_status(self, protocol, _):
+        try:
+            protocol.send(*self._handle_status_request())
+        except ConnectionError:
+            pass
+
     def handle_request(self, proto, cmd, extra_data):
         if cmd == protocol.ToplevelCommand.STATUS:
             return self._handle_status_request()
         elif cmd == protocol.ToplevelCommand.RESCHEDULE:
             self.scheduler._trigger_reload_and_reschedule()
             return protocol.ToplevelCommand.OKAY, None
+        elif cmd == protocol.ToplevelCommand.POLL:
+            self.logger.debug("received poll request")
+            fut = asyncio.Future()
+            fut.add_done_callback(functools.partial(self._send_status, proto))
+            self.poll_futures.append(fut)
+            return self._handle_status_request()
 
         self.logger.debug(
             "no way to handle request %r (extra=%r)",
@@ -188,6 +228,11 @@ class Scheduler:
             self.DEFAULT_PRUNE_SCHEDULE
         )
 
+        self._endpoint = ServerProtocolEndpoint(
+            self.logger.getChild("control"),
+            self
+        )
+
         self._wakeup_event = asyncio.Event(loop=self.loop)
         self._stop_event = asyncio.Event(loop=self.loop)
 
@@ -203,11 +248,6 @@ class Scheduler:
         self._rls_pending = False
         self._shutting_down = False
         self._reload_and_reschedule()
-
-        self._endpoint = ServerProtocolEndpoint(
-            self.logger.getChild("control"),
-            self
-        )
 
     def _save_state(self):
         cfg_path = pathlib.Path(
@@ -276,7 +316,7 @@ class Scheduler:
                 "main task for job %r failed",
                 job_obj
             )
-            self._job_errors[job_obj.key] = str(exc), datetime.utcnow()
+            self.set_job_error(job_obj.key, str(exc))
         else:
             self.logger.warning(
                 "main task for job %r terminated",
@@ -297,6 +337,9 @@ class Scheduler:
                 "task for job %r failed",
                 job_obj
             )
+        else:
+            # clear errors
+            self._job_errors.pop(job_obj.key, None)
 
         if self._job_tasks[job_obj.key] != task:
             self.logger.warning(
@@ -330,6 +373,8 @@ class Scheduler:
                 job_obj.run()
             )
             self._jobs[job_obj.key] = job_obj, main_task
+
+        self._endpoint.notify_poll()
 
     def _add_job(self, job_obj):
         key = job_obj.key
@@ -444,6 +489,7 @@ class Scheduler:
         self.wctsleep.max_slack = self.config.max_slack
 
         self._wakeup_event.set()
+        self._endpoint.notify_poll()
 
     def _scheduled_reload_and_reschedule(self):
         if not self._rls_pending:
@@ -633,7 +679,8 @@ class Scheduler:
                 (
                     "sleep_until",
                     (dt, ),
-                )):
+                ),
+                self._endpoint.notify_poll):
             yield from self.wctsleep.sleep_until(dt)
 
     @asyncio.coroutine
@@ -668,10 +715,7 @@ class Scheduler:
                 break
             except devices.EncryptedDeviceWithoutPassphrase as exc:
                 if problem_known is not type(exc):
-                    self._job_errors[job_key] = (
-                        str(exc),
-                        datetime.utcnow(),
-                    )
+                    self.set_job_error(job_key, str(exc))
                 problem_known = type(exc)
 
             yield from asyncio.sleep(self.config.poll_interval)
@@ -698,7 +742,8 @@ class Scheduler:
                         (
                             "removable_device",
                             (repository_cfg.removable_device_uuid, ),
-                        )):
+                        ),
+                        self._endpoint.notify_poll):
                     return (yield from self._wait_for_removable_device(
                         job_obj.logger,
                         job_obj.key,
@@ -715,7 +760,8 @@ class Scheduler:
                 (
                     "waiting_for_repository_lock",
                     (id_,)
-                )):
+                ),
+                self._endpoint.notify_poll):
             return (yield from self._repository_locks[id_])
 
     def get_job_status(self):
@@ -727,7 +773,17 @@ class Scheduler:
                 self._job_blockers.get(key),
                 self._job_progress.get(key),
                 self._job_errors.get(key),
+                self._last_runs.get(key),
             )
 
     def set_job_progress(self, job_obj, progress):
         self._job_progress[job_obj.key] = progress
+        self._endpoint.notify_poll()
+
+    def set_job_error(self, job_key, message, timestamp=None):
+        timestamp = timestamp or datetime.utcnow()
+        self._job_errors[job_key] = (
+            message,
+            timestamp,
+        )
+        self._endpoint.notify_poll()

@@ -140,12 +140,22 @@ class PruneRepository(PeriodicRepositoryJob):
             self.logger.debug(
                 "pruning archives starting with %r", prefix
             )
+
+            self.scheduler.set_job_progress(
+                self,
+                {
+                    "job": name,
+                }
+            )
+
             yield from self.scheduler.backend.prune_repository(
                 repo_path,
                 context,
                 prefix,
                 **settings,
             )
+
+        self.scheduler.set_job_progress(self, None)
 
 
 class CreateArchive(PeriodicRepositoryJob):

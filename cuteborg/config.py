@@ -110,6 +110,7 @@ class PruneConfig(ConfigElementBase):
 
 class RepositoryConfig(ConfigElementBase):
     id_ = None
+    name = None
     encryption_mode = None
     encryption_passphrase = None
     prune = None
@@ -117,6 +118,7 @@ class RepositoryConfig(ConfigElementBase):
     @abc.abstractmethod
     def load_from_raw(self, raw):
         self.id_ = raw["id"]
+        self.name = raw.get("name", self.id_)
 
         encryption_cfg = raw["encryption"]
 
@@ -134,6 +136,8 @@ class RepositoryConfig(ConfigElementBase):
     def to_raw(self):
         raw = super().to_raw()
         raw["id"] = self.id_
+        if self.id_ != self.name:
+            raw["name"] = self.name
 
         encryption_cfg = raw.setdefault("encryption", {})
         encryption_cfg["mode"] = self.encryption_mode.value

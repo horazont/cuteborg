@@ -23,6 +23,8 @@ class ToplevelCommand(enum.Enum):
 
     RESCHEDULE = b"RLS!"  # ReLoad and reSchedule!
 
+    POLL = b"KMP!"  # Keep Me Posted!
+
     STATUS = b"WIU?"  # What Is Up?
 
     ERROR = b"ERR!"  # ERRor
@@ -135,6 +137,9 @@ class ControlProtocol(asyncio.Protocol):
                 self.send(toplevel, extra_data)
 
     def send(self, cmd, extra_data=None):
+        if not hasattr(self, "_transport"):
+            raise ConnectionError("disconnected")
+
         self.logger.debug("sending %r (extra_data=%r)", cmd, extra_data)
 
         parts = [
@@ -194,10 +199,17 @@ class ControlProtocol(asyncio.Protocol):
     def eof_received(self):
         pass
 
+    def close(self):
+        self._transport.close()
+
 
 class ClientProtocolEndpoint:
     protocol = None
-    response_fut = None
+
+    def __init__(self):
+        super().__init__()
+        self.response_futs = []
+        self.poll_future = None
 
     def close(self):
         if self.protocol is not None:
@@ -205,11 +217,13 @@ class ClientProtocolEndpoint:
 
     @asyncio.coroutine
     def request(self, cmd, extra_data=None, timeout=None):
-        if self.response_fut is not None:
+        if self.response_futs:
             raise RuntimeError("there is a command pending")
+        if self.poll_future is not None:
+            raise RuntimeError("there is a poll pending")
 
         fut = asyncio.Future()
-        self.response_fut = fut
+        self.response_futs.append(fut)
         self.protocol.send(cmd, extra_data)
 
         done, pending = yield from asyncio.wait(
@@ -227,13 +241,65 @@ class ClientProtocolEndpoint:
         self.protocol.breakdown_future.result()
         raise ConnectionError("unknown connection error")
 
+    @asyncio.coroutine
+    def poll_start(self):
+        if self.response_futs:
+            raise RuntimeError("there is a command pending")
+        if self.poll_future is not None:
+            raise RuntimeError("there is a poll pending")
+
+        fut1 = asyncio.Future()
+        self.poll_future = asyncio.Future()
+
+        self.response_futs.append(fut1)
+        self.response_futs.append(self.poll_future)
+
+        self.protocol.send(ToplevelCommand.POLL)
+
+        done, pending = yield from asyncio.wait(
+            [
+                fut1,
+                self.protocol.breakdown_future,
+            ],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if fut1 in done:
+            return fut1.result()
+
+        self.protocol.breakdown_future.result()
+        raise ConnectionError("unknown connection error")
+
+    @asyncio.coroutine
+    def poll_finalise(self):
+        if self.poll_future is None:
+            raise RuntimeError("there is no poll pending")
+
+        done, pending = yield from asyncio.wait(
+            [
+                self.poll_future,
+                self.protocol.breakdown_future,
+            ],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if self.poll_future in done:
+            result = self.poll_future.result()
+            self.poll_future = None
+            return result
+
+        self.poll_future = None
+
+        self.protocol.breakdown_future.result()
+        raise ConnectionError("unknown connection error")
+
     def handle_request(self, protocol, cmd, extra_data):
         assert self.protocol == protocol
-        if self.response_fut is None:
+        if not self.response_futs:
             return protocol.ToplevelCommand.ERROR, None
 
-        self.response_fut.set_result((cmd, extra_data))
-        self.response_fut = None
+        fut = self.response_futs.pop(0)
+        fut.set_result((cmd, extra_data))
 
 
 @asyncio.coroutine
