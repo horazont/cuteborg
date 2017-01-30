@@ -4,6 +4,13 @@ import enum
 import logging
 
 
+class RepositoryLocked(Exception):
+    def __init__(self):
+        super().__init__(
+            "the repository is locked",
+        )
+
+
 class EncryptionMode(enum.Enum):
     NONE = "none"
     KEYFILE = "keyfile"

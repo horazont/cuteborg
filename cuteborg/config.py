@@ -338,9 +338,20 @@ class JobConfig(ConfigElementBase):
         try:
             schedule_cfg = raw["schedule"]
         except KeyError:
-            pass
+            self.schedule = None
         else:
             self.schedule = ScheduleConfig.from_raw(schedule_cfg)
+
+        try:
+            compression_cfg = raw["compression"]
+        except KeyError:
+            self.compression_method = None
+            self.compression_level = None
+        else:
+            self.compression_method = CompressionMethod(
+                compression_cfg["method"]
+            )
+            self.compression_level = compression_cfg.get("level")
 
     def to_raw(self):
         raw = super().to_raw()

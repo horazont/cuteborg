@@ -483,22 +483,48 @@ class Main(Qt.QMainWindow):
         self._jobs = jobs
         self.jobs_model.update_jobs(jobs)
 
-    def _set_error_condition(self, condition, data=()):
+    def _set_error_condition(self, condition, data=(), *,
+                             suppress_notify=False):
         key = condition, data
         if key in self._error_conditions:
             return
 
         self._error_conditions.add(key)
+        self._update_status_label()
 
-        if Qt.QSystemTrayIcon.supportsMessages():
+        if not suppress_notify and Qt.QSystemTrayIcon.supportsMessages():
             self.trayicon.showMessage(
                 "CuteBorg error",
                 condition.value.format(*data),
                 Qt.QSystemTrayIcon.Warning,
             )
 
+    def _update_status_label(self):
+        if self._error_conditions:
+            self.ui.status_box.show()
+            self.ui.status_icon.setPixmap(
+                Qt.QApplication.style().standardIcon(
+                    Qt.QStyle.SP_MessageBoxWarning,
+                ).pixmap(48)
+                # self.icons[None, "error"].pixmap(48),
+            )
+            text = []
+            for condition, data in self._error_conditions:
+                text.append(
+                    "<li>{}</li>".format(
+                        condition.value.format(*data)
+                    )
+                )
+
+            self.ui.status_label.setText(
+                "<h6>Problems:</h6><ul>{}</ul>".format("".join(text))
+            )
+        else:
+            self.ui.status_box.hide()
+
     def _clear_error_condition(self, condition, data=None):
         self._error_conditions.discard((condition, data))
+        self._update_status_label()
 
     def _update_error_conditions_from_jobs(self):
         current_conditions = set()
@@ -683,10 +709,10 @@ class Main(Qt.QMainWindow):
     @asyncio.coroutine
     def _update_loop(self, stop_future):
         self._curr_icon = None, "error"
-        if self._connected:
-            self._set_error_condition(
-                ErrorCondition.SCHEDULER_NOT_RUNNING
-            )
+        self._set_error_condition(
+            ErrorCondition.SCHEDULER_NOT_RUNNING,
+            suppress_notify=not self._connected
+        )
         self._connected = False
         self.trayicon.setIcon(self.icons[self._curr_icon])
 

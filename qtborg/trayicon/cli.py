@@ -51,6 +51,7 @@ def main():
 
     logging.getLogger("quamash").setLevel(logging.INFO)
 
+    Qt.QApplication.setAttribute(Qt.Qt.AA_UseHighDpiPixmaps)
     app = Qt.QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
     asyncio.set_event_loop(quamash.QEventLoop(app=app))

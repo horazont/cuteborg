@@ -1,6 +1,6 @@
 BUILDUI=./utils/buildui.py -5
 
-UIC_SOURCE_FILES=$(wildcard data/ui/trayicon/*.ui)
+UIC_SOURCE_FILES=$(wildcard data/ui/trayicon/*.ui data/ui/manager/*.ui)
 UIC_PYTHON_FILES=$(patsubst data/ui/%.ui,qtborg/%.py,$(UIC_SOURCE_FILES))
 
 TS_FILES=$(wildcard translations/*.ts)

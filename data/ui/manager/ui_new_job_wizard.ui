@@ -22,7 +22,11 @@
    </property>
    <layout class="QVBoxLayout" name="verticalLayout">
     <item>
-     <widget class="QListView" name="listView"/>
+     <widget class="QListView" name="listView">
+      <property name="editTriggers">
+       <set>QAbstractItemView::NoEditTriggers</set>
+      </property>
+     </widget>
     </item>
    </layout>
   </widget>
@@ -119,39 +123,6 @@
     </item>
    </layout>
   </widget>
-  <widget class="QWizardPage" name="page_pruning">
-   <property name="title">
-    <string>Pruning</string>
-   </property>
-   <property name="subTitle">
-    <string>Borg can automatically manage the amount of archives kept. Use the following settings to control the behaviour.</string>
-   </property>
-   <layout class="QVBoxLayout" name="verticalLayout_5">
-    <item>
-     <widget class="QLabel" name="label_2">
-      <property name="text">
-       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-weight:600;&quot;&gt;Note:&lt;/span&gt; If you choose to use the global settings with the box below, changes to the global settings made &lt;span style=&quot; font-style:italic;&quot;&gt;after&lt;/span&gt; the job is created will be applied to the job, too. If you simply want to copy the global settings, uncheck the box below.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-      </property>
-      <property name="wordWrap">
-       <bool>true</bool>
-      </property>
-     </widget>
-    </item>
-    <item>
-     <widget class="QCheckBox" name="checkBox_3">
-      <property name="text">
-       <string>Use global settings</string>
-      </property>
-     </widget>
-    </item>
-    <item>
-     <widget class="PruneWidget" name="widget" native="true"/>
-    </item>
-   </layout>
-   <zorder>widget</zorder>
-   <zorder>checkBox_3</zorder>
-   <zorder>label_2</zorder>
-  </widget>
   <widget class="QWizardPage" name="wizardPage">
    <property name="title">
     <string>Finished!</string>
@@ -194,12 +165,6 @@
   </action>
  </widget>
  <customwidgets>
-  <customwidget>
-   <class>PruneWidget</class>
-   <extends>QWidget</extends>
-   <header>qtborg.prune_widget</header>
-   <container>1</container>
-  </customwidget>
   <customwidget>
    <class>ScheduleWidget</class>
    <extends>QWidget</extends>

@@ -46,6 +46,23 @@ class Job(metaclass=abc.ABCMeta):
     def key(self):
         pass
 
+    @asyncio.coroutine
+    def retry_locked(self, action, *args, **kwargs):
+        while True:
+            try:
+                yield from action(*args, **kwargs)
+            except cuteborg.backend.RepositoryLocked:
+                self.logger.warning(
+                    "repository is locked, will retry after 30 seconds"
+                )
+                self.scheduler.set_job_error(
+                    self.key,
+                    "repository is locked by an external process",
+                )
+                yield from asyncio.sleep(30)
+                continue
+            break
+
     @abc.abstractmethod
     def exec(self):
         """
@@ -148,12 +165,14 @@ class PruneRepository(PeriodicRepositoryJob):
                 }
             )
 
-            yield from self.scheduler.backend.prune_repository(
+            yield from self.retry_locked(
+                self.scheduler.backend.prune_repository,
                 repo_path,
                 context,
                 prefix,
                 **settings,
             )
+            self.scheduler.set_job_error(self.key, None)
 
         self.scheduler.set_job_progress(self, None)
 
@@ -170,6 +189,7 @@ class CreateArchive(PeriodicRepositoryJob):
                 self.repository_cfg.id_)
 
     def _update_progress(self, progress):
+        self.scheduler.set_job_error(self.key, None)
         if progress is not None:
             self.scheduler.set_job_progress(
                 self,
@@ -195,7 +215,8 @@ class CreateArchive(PeriodicRepositoryJob):
         self.repository_cfg.setup_context(context)
         self.job_cfg.setup_context(context)
 
-        yield from self.scheduler.backend.create_archive(
+        yield from self.retry_locked(
+            self.scheduler.backend.create_archive,
             repo_path,
             archive_name,
             self.job_cfg.sources,

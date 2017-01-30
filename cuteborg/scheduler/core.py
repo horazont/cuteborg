@@ -796,6 +796,15 @@ class Scheduler:
         self._endpoint.notify_poll()
 
     def set_job_error(self, job_key, message, timestamp=None):
+        if message is None:
+            try:
+                del self._job_errors[job_key]
+            except KeyError:
+                pass
+            else:
+                self._endpoint.notify_poll()
+            return
+
         timestamp = timestamp or datetime.utcnow()
         self._job_errors[job_key] = (
             message,

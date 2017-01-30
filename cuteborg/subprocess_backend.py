@@ -44,6 +44,11 @@ DELETE_PROGRESS_RE = re.compile(
 )
 
 
+LOCK_TIMEOUT_FINGERPRINT = (
+    b"('Remote Exception (see remote log for the traceback)', 'LockTimeout')"
+)
+
+
 def parse_version(s):
     m = VERSION_RE.match(s)
     if m is None:
@@ -229,9 +234,11 @@ class LocalSubprocessBackend(backend.Backend):
         proc = yield from asyncio.create_subprocess_exec(
             *args,
             env=env,
+            stderr=subprocess.PIPE,
         )
 
         try:
+            _, stderr = yield from proc.communicate()
             yield from proc.wait()
         except asyncio.CancelledError:
             if proc.returncode is None:
@@ -240,9 +247,13 @@ class LocalSubprocessBackend(backend.Backend):
             raise
 
         if proc.returncode != 0:
+            if LOCK_TIMEOUT_FINGERPRINT in stderr:
+                raise backend.RepositoryLocked()
+
             raise subprocess.CalledProcessError(
                 proc.returncode,
                 args,
+                stderr=stderr,
             )
 
     @asyncio.coroutine
@@ -258,16 +269,24 @@ class LocalSubprocessBackend(backend.Backend):
             try:
                 while True:
                     line = yield from proc.stderr.readuntil(b"\r")
+                    print(line)
+                    if LOCK_TIMEOUT_FINGERPRINT in line:
+                        raise backend.RepositoryLocked()
                     potential_information.extend(line)
                     line_callback(line.decode())
             except asyncio.streams.IncompleteReadError as exc:
+                if LOCK_TIMEOUT_FINGERPRINT in exc.partial:
+                    raise backend.RepositoryLocked() from None
                 potential_information.extend(exc.partial)
 
             yield from proc.wait()
-        except asyncio.CancelledError:
+        except:
             if proc.returncode is None:
-                proc.terminate()
-            yield from proc.wait()
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                yield from proc.wait()
             raise
 
         if proc.returncode != 0:
