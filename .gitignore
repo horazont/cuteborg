@@ -1,3 +1,5 @@
 __pycache__
 /qtborg/**/ui_*.py
 /.local
+/dist
+/*.egg-info
