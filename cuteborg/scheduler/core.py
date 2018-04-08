@@ -5,12 +5,15 @@ import functools
 import logging
 import pathlib
 import signal
+import socket
 import tempfile
 import uuid
 
 from datetime import datetime
 
 import toml
+
+import pytz
 
 import xdg.BaseDirectory
 
@@ -158,7 +161,6 @@ class ServerProtocolEndpoint:
                 reason, args = blocker
                 item["blocking"] = {}
                 item["blocking"]["reason"] = reason
-                item["blocking"]["raw_info"] = list(args)
 
                 if reason == "waiting_for_repository_lock":
                     repo_id, = args
@@ -177,6 +179,16 @@ class ServerProtocolEndpoint:
                     dev_uuid, = args
                     item["blocking"]["struct_info"] = {}
                     item["blocking"]["struct_info"]["device_uuid"] = dev_uuid
+
+                elif reason == "network_host":
+                    host, extra = args
+                    item["blocking"]["struct_info"] = {}
+                    item["blocking"]["struct_info"]["host"] = host
+                    if extra is not None:
+                        item["blocking"]["struct_info"]["extra"] = extra
+
+                else:
+                    item["blocking"]["raw_info"] = list(args)
 
             if progress is not None:
                 item["progress"] = progress
@@ -211,6 +223,29 @@ class ServerProtocolEndpoint:
             fut.add_done_callback(functools.partial(self._send_status, proto))
             self.poll_futures.append(fut)
             return self._handle_status_request()
+        elif cmd == protocol.ToplevelCommand.EXIT:
+            self.scheduler._trigger_exit()
+            return protocol.ToplevelCommand.OKAY, None
+        elif cmd == protocol.ToplevelCommand.EXTENDED_REQUEST:
+            try:
+                if extra_data["command"] == "force-archive":
+                    job = extra_data["force-archive"]["name"]
+                    only = extra_data["force-archive"].get("repositories")
+                    self.scheduler._force_archive(
+                        job,
+                        only=only,
+                    )
+                    return protocol.ToplevelCommand.OKAY, None
+                elif extra_data["command"] == "force-prune":
+                    self.scheduler._force_prune(
+                        extra_data["force-prune"]["repositories"]
+                    )
+                    return protocol.ToplevelCommand.OKAY, None
+            except KeyError as exc:
+                self.logger.debug(
+                    "missing required data for extended request (%r)",
+                    exc,
+                )
 
         self.logger.debug(
             "no way to handle request %r (extra=%r)",
@@ -234,19 +269,15 @@ class Scheduler:
             logger=self.logger.getChild("backend")
         )
 
-        self.wctsleep = wctsleep.WallClockTimeSleepImpl()
+        self.wctsleep = None
 
         self._default_prune_schedule = config.ScheduleConfig.from_raw(
             self.DEFAULT_PRUNE_SCHEDULE
         )
 
-        self._endpoint = ServerProtocolEndpoint(
-            self.logger.getChild("control"),
-            self
-        )
-
-        self._wakeup_event = asyncio.Event(loop=self.loop)
-        self._stop_event = asyncio.Event(loop=self.loop)
+        self._endpoint = None
+        self._wakeup_event = None
+        self._stop_event = None
 
         self._last_runs = {}
         self._jobs = {}
@@ -254,12 +285,15 @@ class Scheduler:
         self._job_blockers = {}
         self._job_progress = {}
         self._job_errors = {}
+        self._sleep_tasks = {}
+        self._repository_locks = {}
+        self._deferred_jobs = set()
 
         self._load_state()
 
         self._rls_pending = False
         self._shutting_down = False
-        self._reload_and_reschedule()
+        self._reload_and_reschedule(defer=True)
 
     def _save_state(self):
         cfg_path = pathlib.Path(
@@ -388,31 +422,39 @@ class Scheduler:
 
         self._endpoint.notify_poll()
 
-    def _add_job(self, job_obj):
+    def _add_job(self, job_obj, defer):
         key = job_obj.key
 
-        if key in self._job_tasks:
+        try:
+            job_obj, main_task = self._jobs[key]
+        except KeyError:
+            if defer:
+                self.logger.debug("deferring startup of task for job %r",
+                                  job_obj)
+                self._deferred_jobs.add(key)
+                main_task = None
+            else:
+                self.logger.debug("starting main task for job %r", job_obj)
+                main_task = asyncio.ensure_future(job_obj.run())
+                main_task.add_done_callback(
+                    functools.partial(
+                        self._job_main_task_done,
+                        job_obj,
+                    )
+                )
+        else:
             self.logger.debug(
                 "deferring start of main task for job %r, as a task "
                 "is currently running",
                 job_obj
             )
             main_task = None
-        else:
-            self.logger.debug("starting main task for job %r", job_obj)
-            main_task = asyncio.ensure_future(job_obj.run())
-            main_task.add_done_callback(
-                functools.partial(
-                    self._job_main_task_done,
-                    job_obj,
-                )
-            )
 
         self._jobs[key] = (
             job_obj, main_task
         )
 
-    def _reload_and_reschedule(self):
+    def _reload_and_reschedule(self, defer=False):
         self._rls_pending = False
         self.logger.debug("reloading configuration")
         self.config = config.Config.from_raw(config.load_config())
@@ -423,27 +465,30 @@ class Scheduler:
             len(self.config.jobs),
         )
 
-        self._repository_locks = {}
-
         for job_obj, job_main_task in self._jobs.values():
             if job_main_task is not None:
                 self.logger.debug("stopping main task of job %s", job_obj.key)
                 job_main_task.cancel()
 
         self._jobs.clear()
+        self._deferred_jobs.clear()
         self._job_errors.clear()
 
         new_repositories = set(self.config.repositories)
         old_repositories = set(self._repository_locks)
 
-        for id_ in (new_repositories - old_repositories):
-            # create locks for added repositories
-            self.logger.debug("repository %r: preparing", id_)
-            self._repository_locks[id_] = asyncio.Lock(loop=self.loop)
+        self.logger.debug("old repositories = %r, new repositories = %r",
+                          old_repositories, new_repositories)
 
-        for id_ in (old_repositories - new_repositories):
-            self.logger.debug("repository %r removed -- tearing down", id_)
-            del self._repository_locks[id_]
+        if not defer:
+            for id_ in (new_repositories - old_repositories):
+                # create locks for added repositories
+                self.logger.debug("repository %r: preparing", id_)
+                self._repository_locks[id_] = asyncio.Lock(loop=self.loop)
+
+            for id_ in (old_repositories - new_repositories):
+                self.logger.debug("repository %r removed -- tearing down", id_)
+                del self._repository_locks[id_]
 
         # At this point, last_run information needs to be available
 
@@ -468,7 +513,7 @@ class Scheduler:
                     repository.prune.schedule or self._default_prune_schedule,
                 )
 
-                self._add_job(job_obj)
+                self._add_job(job_obj, defer)
 
         for name, job in self.config.jobs.items():
             for repository in job.repositories:
@@ -490,7 +535,7 @@ class Scheduler:
                     job.schedule or self.config.schedule,
                 )
 
-                self._add_job(job_obj)
+                self._add_job(job_obj, defer)
 
         self.logger.debug("repository_locks = %r", self._repository_locks)
         self.logger.debug("jobs = %r", self._jobs)
@@ -498,10 +543,12 @@ class Scheduler:
         self.logger.debug("max_slack = %r", self.config.max_slack)
         self.logger.debug("poll_interval = %r", self.config.poll_interval)
 
-        self.wctsleep.max_slack = self.config.max_slack
-
-        self._wakeup_event.set()
-        self._endpoint.notify_poll()
+        if self.wctsleep is not None:
+            self.wctsleep.max_slack = self.config.max_slack
+        if self._wakeup_event is not None:
+            self._wakeup_event.set()
+        if self._endpoint is not None:
+            self._endpoint.notify_poll()
 
     def _scheduled_reload_and_reschedule(self):
         if not self._rls_pending:
@@ -518,6 +565,9 @@ class Scheduler:
             self._scheduled_reload_and_reschedule
         )
 
+    def _trigger_exit(self):
+        self._stop_event.set()
+
     def _signalled_reload_and_reschedule(self):
         self.logger.info(
             "reload and reschedule requested via SIGUSR1/SIGHUP -- "
@@ -527,6 +577,19 @@ class Scheduler:
 
     @asyncio.coroutine
     def _main_loop(self):
+        for key in self._deferred_jobs:
+            try:
+                job_obj, main_task = self._jobs.pop(key)
+            except KeyError:
+                continue
+
+            if main_task is None:
+                self._add_job(job_obj, False)
+            else:
+                self._jobs[key] = job_obj, main_task
+
+        self._deferred_jobs.clear()
+
         with contextlib.ExitStack() as stack:
             stop_future = stack.enter_context(
                 cancelling(
@@ -560,7 +623,7 @@ class Scheduler:
             return True
 
     @asyncio.coroutine
-    def main(self):
+    def check_server_socket(self):
         try:
             endpoint = yield from asyncio.wait_for(
                 protocol.test_and_get_socket(
@@ -608,6 +671,37 @@ class Scheduler:
             )
             return 1
 
+    def create_server_socket(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+        sock.bind(str(self.socket_path))
+        return sock
+
+    @asyncio.coroutine
+    def bind_server_socket(self, sock):
+        return (yield from self.loop.create_unix_server(
+            self._create_protocol,
+            sock=sock,
+        ))
+
+    @asyncio.coroutine
+    def main(self, sock=None, loop=None):
+        if sock is None:
+            yield from self.check_server_socket()
+            sock = self.create_server_socket()
+
+        if loop is not None and loop != self.loop:
+            self.loop = loop
+
+        self._endpoint = ServerProtocolEndpoint(
+            self.logger.getChild("control"),
+            self
+        )
+        self._wakeup_event = asyncio.Event(loop=loop)
+        self._stop_event = asyncio.Event(loop=loop)
+        self.wctsleep = wctsleep.WallClockTimeSleepImpl()
+        self._repository_locks.clear()
+        self._reload_and_reschedule()
+
         self.loop.add_signal_handler(signal.SIGINT, self._stop_event.set)
         self.loop.add_signal_handler(signal.SIGTERM, self._stop_event.set)
 
@@ -620,10 +714,7 @@ class Scheduler:
             self._signalled_reload_and_reschedule,
         )
 
-        server = yield from self.loop.create_unix_server(
-            self._create_protocol,
-            str(self.socket_path),
-        )
+        server = yield from self.bind_server_socket(sock)
 
         self.logger.info("server started up")
 
@@ -639,7 +730,7 @@ class Scheduler:
             server.close()
             self._stop_event.clear()
             self.logger.warning(
-                "waiting for server and tasks shutdown -- "
+                "stopping server and tasks -- "
                 "if it hangs, send SIGINT/SIGTERM again"
             )
 
@@ -663,22 +754,47 @@ class Scheduler:
                 self.wctsleep.cancel_and_wait()
             )
 
+            other_futures = [
+                asyncio.ensure_future(fut)
+                for fut in other_futures
+            ]
+
             other_futures_fut = asyncio.ensure_future(
                 asyncio.wait(
                     other_futures,
                 ),
             )
 
+            def debug_done(fut):
+                self.logger.debug("shutdown: %r finished", fut)
+
+            for fut in other_futures:
+                fut.add_done_callback(debug_done)
+                self.logger.debug("waiting for: %r", fut)
+
+            self.logger.warning(
+                "waiting for server and tasks -- "
+                "if it hangs, send SIGINT/SIGTERM again"
+            )
+
+            stop_fut = asyncio.ensure_future(self._stop_event.wait())
+
             done, pending = yield from asyncio.wait(
                 [
-                    self._stop_event.wait(),
+                    stop_fut,
                     other_futures_fut,
                 ],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
             for fut in pending:
+                if fut != stop_fut:
+                    self.logger.warning("not finished: %r", fut)
                 fut.cancel()
+
+            self.logger.debug(
+                "shutdown completed"
+            )
 
     def get_last_run(self, key):
         return self._last_runs.get(key)
@@ -693,9 +809,20 @@ class Scheduler:
                     (dt, ),
                 ),
                 self._endpoint.notify_poll):
-            yield from self.wctsleep.sleep_until(dt)
+            wait_task = asyncio.ensure_future(
+                self.wctsleep.sleep_until(dt)
+            )
+            self._sleep_tasks[job_obj.key] = wait_task, False
+            try:
+                yield from wait_task
+            except asyncio.CancelledError:
+                _, awoken = self._sleep_tasks.get(job_obj.key, (None, False))
+                if awoken:
+                    return
+                raise
+            finally:
+                self._sleep_tasks.pop(job_obj.key, None)
 
-    @asyncio.coroutine
     def execute_job(self, job_obj, **kwargs):
         key = job_obj.key
         task = asyncio.ensure_future(job_obj.exec(**kwargs))
@@ -707,11 +834,57 @@ class Scheduler:
                 datetime.utcnow()
             )
         )
-        yield from asyncio.shield(task)
+        return asyncio.ensure_future(asyncio.shield(task))
+
+    def _force_archive(self, job, only=None):
+        if only is not None:
+            keys = [
+                ("create_archive", job, repo)
+                for repo in only
+            ]
+        else:
+            keys = [
+                key
+                for key in self._sleep_tasks.keys()
+                if key[0] == "create_archive" and key[1] == job
+            ]
+
+        tasks = []
+        for key in keys:
+            sleeper, _ = self._sleep_tasks[key]
+            self._sleep_tasks[key] = sleeper, True
+            sleeper.cancel()
+
+    def _force_prune(self, repositories):
+        keys = [
+            ("prune", repo)
+            for repo in repositories
+        ]
+
+        tasks = []
+        for key in keys:
+            sleeper, _ = self._sleep_tasks[key]
+            self._sleep_tasks[key] = sleeper, True
+            sleeper.cancel()
 
     @asyncio.coroutine
-    def _wait_for_remote_repository(self, logger, job_key, remote_repo):
-        return remote_repo.make_repository_path()
+    def _wait_for_remote_repository(self, logger, job_key, remote_repo,
+                                    update_status):
+        context = cuteborg.backend.Context()
+        remote_repo.setup_context(context)
+
+        path = remote_repo.make_repository_path()
+        while True:
+            try:
+                yield from self.backend.ping(path, context)
+            except cuteborg.backend.RepositoryUnreachable as exc:
+                update_status(str(exc))
+            else:
+                break
+
+            yield from asyncio.sleep(self.config.poll_interval)
+
+        return path
 
     @asyncio.coroutine
     def _wait_for_removable_device(self, logger, job_key, local_repo):
@@ -744,11 +917,37 @@ class Scheduler:
     @asyncio.coroutine
     def wait_for_repository_storage(self, job_obj, repository_cfg):
         if isinstance(repository_cfg, config.RemoteRepositoryConfig):
-            return (yield from self._wait_for_remote_repository(
-                job_obj.logger,
-                job_obj.key,
-                repository_cfg
-            ))
+            with contextlib.ExitStack() as stack:
+                has_block = False
+
+                def update_status(msg):
+                    nonlocal has_block
+                    argv = (
+                        "network_host",
+                        (repository_cfg.host, msg),
+                    )
+                    if not has_block:
+                        stack.enter_context(
+                            note_job_block(
+                                self._job_blockers,
+                                job_obj.key,
+                                (
+                                    "network_host",
+                                    (repository_cfg.host, msg),
+                                ),
+                                self._endpoint.notify_poll)
+                        )
+                        has_block = True
+                    else:
+                        self._job_blockers[job_obj.key] = argv
+                        self._endpoint.notify_poll()
+
+                return (yield from self._wait_for_remote_repository(
+                    job_obj.logger,
+                    job_obj.key,
+                    repository_cfg,
+                    update_status,
+                ))
         elif isinstance(repository_cfg, config.LocalRepositoryConfig):
             if repository_cfg.removable_device_uuid is not None:
                 with note_job_block(

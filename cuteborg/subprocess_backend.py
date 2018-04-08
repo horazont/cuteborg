@@ -1,7 +1,9 @@
 import ast
 import asyncio
+import base64
 import functools
 import os
+import random
 import re
 import subprocess
 
@@ -38,14 +40,28 @@ CREATE_PROGRESS_RE = re.compile(
 )
 
 
+SYNC_PROGRESS_RE = re.compile(
+    r"^\s*(?P<synced>[0-9]+)% Syncing chunks cache\..+$",
+    re.I,
+)
+
+
 DELETE_PROGRESS_RE = re.compile(
     r"^Decrementing references\s+(?P<progress>\d+)%\s*$",
     re.I,
 )
 
 
-LOCK_TIMEOUT_FINGERPRINT = (
+LOCK_TIMEOUT_FINGERPRINT_1_0 = (
     b"('Remote Exception (see remote log for the traceback)', 'LockTimeout')"
+)
+
+LOCK_TIMEOUT_FINGERPRINT_1_1 = (
+    b"Failed to create/acquire the lock",
+)
+
+CONNECTION_ERROR_FINGERPRINT = (
+    b"Remote: ssh: "
 )
 
 
@@ -88,17 +104,31 @@ def format_version(v):
 
 
 def forward_create_progress(cb, s):
+    info = {
+        "nfiles": 0,
+        "uncompressed": 0,
+        "compressed": 0,
+        "deduplicated": 0,
+        "synced": 0,
+    }
+
     parsed = CREATE_PROGRESS_RE.match(s)
-    if parsed is None:
-        cb(None)
+    if parsed is not None:
+        info = parsed.groupdict()
+        info["nfiles"] = int(info["nfiles"])
+        info["uncompressed"] = tuple(info["uncompressed"].split())
+        info["compressed"] = tuple(info["compressed"].split())
+        info["deduplicated"] = tuple(info["deduplicated"].split())
+        info["synced"] = 1
+        cb(info)
         return
 
-    info = parsed.groupdict()
-    info["nfiles"] = int(info["nfiles"])
-    info["uncompressed"] = tuple(info["uncompressed"].split())
-    info["compressed"] = tuple(info["compressed"].split())
-    info["deduplicated"] = tuple(info["deduplicated"].split())
-    cb(info)
+    parsed = SYNC_PROGRESS_RE.match(s)
+    if parsed is not None:
+        raw_info = parsed.groupdict()
+        info["synced"] = int(raw_info["synced"]) / 100
+        cb(info)
+        return
 
 
 def forward_delete_progress(cb, s):
@@ -112,9 +142,27 @@ def forward_delete_progress(cb, s):
     cb(info)
 
 
+@asyncio.coroutine
+def readuntil_either(stream, separators):
+    buf = bytearray()
+    while True:
+        ch = yield from stream.read(1)
+        if not ch:
+            raise asyncio.streams.IncompleteReadError(
+                bytes(buf),
+                separators,
+            )
+
+        buf.append(ord(ch))
+        if ch in separators:
+            break
+
+    return bytes(buf)
+
+
 class LocalSubprocessBackend(backend.Backend):
     SUPPORTED_VERSION_RANGES = [
-        ((1, 0, 8), (1, 1, 0)),
+        ((1, 0, 8), (1, 2, 0)),
     ]
 
     LIST_FORMAT = (
@@ -133,6 +181,12 @@ class LocalSubprocessBackend(backend.Backend):
         "'source': {source!r}, "
         "}}, "
     )
+
+    @staticmethod
+    def make_call_id():
+        return "call-{}".format(base64.b32encode(
+            random.getrandbits(40).to_bytes(5, 'little')
+        ).decode("ascii").lower())
 
     def __init__(self,
                  logger=None, *,  # NOQA
@@ -181,7 +235,19 @@ class LocalSubprocessBackend(backend.Backend):
             )
         )
 
-    def _prep_call(self, args, env, context):
+    def _raise_common_errors(self, stderr):
+        if stderr.startswith(CONNECTION_ERROR_FINGERPRINT):
+            raise backend.RepositoryUnreachable(
+                stderr.split(b"\n", 1)[0].decode()
+            )
+
+        if stderr.startswith(LOCK_TIMEOUT_FINGERPRINT_1_1):
+            raise backend.RepositoryLocked()
+
+        if LOCK_TIMEOUT_FINGERPRINT_1_0 in stderr:
+            raise backend.RepositoryLocked()
+
+    def _prep_call(self, args, env, context, call_id):
         args = [self.path_to_borg] + args
 
         if context.dry_run:
@@ -191,8 +257,14 @@ class LocalSubprocessBackend(backend.Backend):
         env.update(env)
         env["LANG"] = "C"
 
+        if context.borg_remote_path is not None:
+            env["BORG_REMOTE_PATH"] = context.borg_remote_path
+
+        env["BORG_RELOCATED_REPO_ACCESS_IS_OK"] = "yes"
+
         self.logger.debug(
-            "prepared call: %r, with env=%r (passphrase omitted from env)",
+            "%s: prepared: %r, with env=%r (passphrase omitted from env)",
+            call_id,
             args,
             env,
         )
@@ -200,55 +272,41 @@ class LocalSubprocessBackend(backend.Backend):
         if context.passphrase is not None:
             env["BORG_PASSPHRASE"] = context.passphrase
 
-        if context.borg_remote_path is not None:
-            env["BORG_REMOTE_PATH"] = context.borg_remote_path
-
         return args, env
 
-    # def _call_and_wait(self, args, env, context):
-    #     args, env = self._prep_call(args, env, context)
-    #     return subprocess.check_output(
-    #         args,
-    #         env=env,
-    #     )
-
-    # def _call_lines(self, args, env, context, line_callback):
-    #     args, env = self._prep_call(args, env, context)
-
-    #     proc = subprocess.Popen(
-    #         args,
-    #         env=env,
-    #         stderr=subprocess.PIPE,
-    #         universal_newlines=True,
-    #     )
-
-    #     for line in proc.stderr:
-    #         if not line:
-    #             break
-    #         line_callback(line)
-
-    #     proc.wait()
-
     @asyncio.coroutine
-    def _call(self, args, env):
+    def _call(self, args, env, call_id):
+        self.logger.debug("%s: invoking %s", call_id, args)
+
         proc = yield from asyncio.create_subprocess_exec(
             *args,
             env=env,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
 
+        self.logger.debug("%s: started", call_id)
+
         try:
             _, stderr = yield from proc.communicate()
-            yield from proc.wait()
+            self.logger.debug("%s: communicate returned: %r", call_id, stderr)
         except asyncio.CancelledError:
+            self.logger.debug("%s: cancelled", call_id)
             if proc.returncode is None:
+                self.logger.debug("%s: terminating child", call_id)
                 proc.terminate()
-            yield from proc.wait()
+                _, stderr = yield from proc.communicate()
+                self.logger.debug("%s: communicate returned: %r",
+                                  call_id, stderr)
             raise
+        finally:
+            self.logger.debug("%s: waiting for child", call_id)
+            yield from proc.wait()
 
+        self.logger.debug("%s: finished", call_id)
         if proc.returncode != 0:
-            if LOCK_TIMEOUT_FINGERPRINT in stderr:
-                raise backend.RepositoryLocked()
+            self.logger.debug("%s: non-zero exit code", call_id)
+            self._raise_common_errors(stderr)
 
             raise subprocess.CalledProcessError(
                 proc.returncode,
@@ -257,39 +315,53 @@ class LocalSubprocessBackend(backend.Backend):
             )
 
     @asyncio.coroutine
-    def _call_lines(self, args, env, line_callback):
+    def _call_lines(self, args, env, line_callback, call_id):
+        self.logger.debug("%s: invoking %s", call_id, args)
+
         proc = yield from asyncio.create_subprocess_exec(
             *args,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             env=env,
         )
+
+        self.logger.debug("%s: started", call_id)
 
         try:
             potential_information = bytearray()
             try:
                 while True:
-                    line = yield from proc.stderr.readuntil(b"\r")
-                    print(line)
-                    if LOCK_TIMEOUT_FINGERPRINT in line:
-                        raise backend.RepositoryLocked()
+                    line = yield from readuntil_either(
+                        proc.stderr,
+                        b"\r\n"
+                    )
+                    self.logger.debug("%s: << %r", call_id, line.strip())
+                    # detect and raise errors earily
+                    self._raise_common_errors(line)
                     potential_information.extend(line)
                     line_callback(line.decode())
             except asyncio.streams.IncompleteReadError as exc:
-                if LOCK_TIMEOUT_FINGERPRINT in exc.partial:
+                if LOCK_TIMEOUT_FINGERPRINT_1_0 in exc.partial:
                     raise backend.RepositoryLocked() from None
                 potential_information.extend(exc.partial)
 
             yield from proc.wait()
         except:
+            self.logger.debug("%s: failure / cancellation", call_id)
             if proc.returncode is None:
+                self.logger.debug("%s: terminating child", call_id)
                 try:
                     proc.terminate()
                 except ProcessLookupError:
                     pass
+                self.logger.debug("%s: waiting for child", call_id)
                 yield from proc.wait()
             raise
 
+        self.logger.debug("%s: finished", call_id)
         if proc.returncode != 0:
+            self.logger.debug("%s: non-zero exit code", call_id)
+            self._raise_common_errors(potential_information)
             raise subprocess.CalledProcessError(
                 proc.returncode,
                 args,
@@ -314,6 +386,24 @@ class LocalSubprocessBackend(backend.Backend):
         return self._call(args, {}, context)
 
     @asyncio.coroutine
+    def ping(self, path, context):
+        call_id = self.make_call_id()
+
+        args = [
+            "info",
+            path,
+        ]
+
+        env = {}
+
+        args, env = self._prep_call(args, env, context, call_id)
+
+        try:
+            yield from self._call(args, env, call_id)
+        except backend.RepositoryLocked:
+            pass
+
+    @asyncio.coroutine
     def prune_repository(self, path,
                          context,
                          prefix,
@@ -324,6 +414,8 @@ class LocalSubprocessBackend(backend.Backend):
                          monthly=None,
                          yearly=None,
                          keep_within=None):
+        call_id = self.make_call_id()
+
         args = [
             "prune",
             path,
@@ -351,15 +443,16 @@ class LocalSubprocessBackend(backend.Backend):
                 "--keep-within", str(keep_within)
             ])
 
-        args, env = self._prep_call(args, {}, context)
+        args, env = self._prep_call(args, {}, context, call_id)
 
-        return (yield from self._call(args, env))
+        return (yield from self._call(args, env, call_id))
 
     @asyncio.coroutine
     def create_archive(self, path, name, source_paths, context):
+        call_id = self.make_call_id()
+
         args = [
             "create",
-            "::".join([path, name])
         ]
         env = {}
 
@@ -379,25 +472,37 @@ class LocalSubprocessBackend(backend.Backend):
 
         if (context.network_limit_upstream is not None
                 or context.network_limit_downstream is not None):
-            self.logger.warning(
-                "using network limiting is experimental and may make borg hang"
-            )
-            parts = ["-s"]
-            if context.network_limit_upstream is not None:
-                parts.extend([
-                    "-u", str(context.network_limit_upstream),
-                ])
-            if context.network_limit_downstream is not None:
-                parts.extend([
-                    "-d", str(context.network_limit_downstream),
-                ])
+            if context.network_limit_builtin is not None:
+                self.logger.warning(
+                    "ignoring upstream/downstream limiting and using only borg"
+                    " internal ratelimiting"
+                )
+            else:
+                self.logger.warning(
+                    "using legacy network limiting is experimental and may "
+                    "make borg hang"
+                )
+                parts = ["-s"]
+                if context.network_limit_upstream is not None:
+                    parts.extend([
+                        "-u", str(context.network_limit_upstream),
+                    ])
+                if context.network_limit_downstream is not None:
+                    parts.extend([
+                        "-d", str(context.network_limit_downstream),
+                    ])
 
-            env["BORG_RSH"] = "trickle {} ssh".format(" ".join(parts))
+                env["BORG_RSH"] = "trickle {} ssh".format(" ".join(parts))
+
+        if context.network_limit_builtin is not None:
+            args.insert(0, "--remote-ratelimit")
+            args.insert(1, str(context.network_limit_builtin))
 
         args.append("--")
+        args.append("::".join([path, name]))
         args.extend(map(str, source_paths))
 
-        args, env = self._prep_call(args, env, context)
+        args, env = self._prep_call(args, env, context, call_id)
 
         line_proc = functools.partial(
             forward_create_progress,
@@ -405,7 +510,7 @@ class LocalSubprocessBackend(backend.Backend):
         )
 
         try:
-            yield from self._call_lines(args, env, line_proc)
+            yield from self._call_lines(args, env, line_proc, call_id)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(
                 "create_archive operation failed: {}".format(

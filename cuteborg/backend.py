@@ -11,6 +11,14 @@ class RepositoryLocked(Exception):
         )
 
 
+class RepositoryUnreachable(ConnectionError):
+    def __init__(self, extra=None):
+        msg = "the repository is unreachable"
+        if extra is not None:
+            msg = "{}: {}".format(msg, extra)
+        super().__init__(msg)
+
+
 class EncryptionMode(enum.Enum):
     NONE = "none"
     KEYFILE = "keyfile"
@@ -45,6 +53,7 @@ ArchiveInfo = collections.namedtuple(
 class Context:
     network_limit_upstream = None
     network_limit_downstream = None
+    network_limit_builtin = None
     one_file_system = False
     compression = CompressionMethod.NONE
     compression_level = None

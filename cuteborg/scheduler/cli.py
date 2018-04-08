@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import inspect
 import logging
+import os
 import pathlib
 import pprint
 import sys
@@ -13,10 +15,50 @@ from .. import utils
 from . import core, status, protocol
 
 
-@asyncio.coroutine
 def cmd_run(loop, args):
+    logger = logging.getLogger("cuteborg.scheduler")
+
     scheduler = core.Scheduler(loop, args.socket_path)
-    return (yield from scheduler.main())
+
+    server = loop.run_until_complete(scheduler.check_server_socket())
+    sock = scheduler.create_server_socket()
+
+    if args.daemonize:
+        logger.debug("forking into background")
+
+        try:
+            pid = os.fork()
+        except OSError:
+            logger.error("failed to fork")
+            return
+
+        if pid != 0:
+            # parent
+            return 0
+
+        # child
+        # start new session
+        os.setsid()
+        try:
+            pid = os.fork()
+        except OSError:
+            logger.error("second fork failed")
+            return 1
+
+        if pid != 0:
+            # parent -> exit
+            return 0
+
+        logger.debug("double-forked into background")
+
+    asyncio.get_event_loop().close()
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    loop.run_until_complete(scheduler.main(sock=sock, loop=loop))
+
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 def _format_value(value):
@@ -163,6 +205,133 @@ def cmd_reload(loop, args):
         return 2
 
 
+@asyncio.coroutine
+def cmd_stop(loop, args):
+    logger = logging.getLogger("cuteborg.scheduler")
+
+    try:
+        endpoint = yield from asyncio.wait_for(
+            protocol.test_and_get_socket(
+                loop,
+                logger,
+                args.socket_path,
+            ),
+            timeout=5
+        )
+    except (asyncio.TimeoutError, FileNotFoundError, ConnectionError) as exc:
+        msg = str(exc)
+        if isinstance(exc, asyncio.TimeoutError):
+            msg = "timeout"
+        logger.error("failed to connect to scheduler at %r: %s",
+                     str(args.socket_path),
+                     msg)
+        raise RuntimeError(
+            "failed to connect to scheduler"
+        )
+
+    response, data = yield from endpoint.request(
+        protocol.ToplevelCommand.EXIT
+    )
+
+    if response != protocol.ToplevelCommand.OKAY:
+        logger.error("could not stop scheduler")
+        return 2
+
+    logger.info("scheduler stopping")
+
+    try:
+        yield from endpoint.protocol.breakdown_future
+    except OSError:
+        pass
+    logger.info("scheduler stopped")
+
+
+@asyncio.coroutine
+def cmd_force_archive(loop, args):
+    logger = logging.getLogger("cuteborg.scheduler")
+
+    try:
+        endpoint = yield from asyncio.wait_for(
+            protocol.test_and_get_socket(
+                loop,
+                logger,
+                args.socket_path,
+            ),
+            timeout=5
+        )
+    except (asyncio.TimeoutError, FileNotFoundError, ConnectionError) as exc:
+        msg = str(exc)
+        if isinstance(exc, asyncio.TimeoutError):
+            msg = "timeout"
+        logger.error("failed to connect to scheduler at %r: %s",
+                     str(args.socket_path),
+                     msg)
+        raise RuntimeError(
+            "failed to connect to scheduler"
+        )
+
+    request = {
+        "command": "force-archive",
+        "force-archive": {
+            "name": args.job,
+            "only": list(set(args.only)),
+        }
+    }
+
+    response, data = yield from endpoint.request(
+        protocol.ToplevelCommand.EXTENDED_REQUEST,
+        request,
+    )
+
+    print(response, data)
+
+
+@asyncio.coroutine
+def cmd_force_prune(loop, args):
+    logger = logging.getLogger("cuteborg.scheduler")
+
+    try:
+        endpoint = yield from asyncio.wait_for(
+            protocol.test_and_get_socket(
+                loop,
+                logger,
+                args.socket_path,
+            ),
+            timeout=5
+        )
+    except (asyncio.TimeoutError, FileNotFoundError, ConnectionError) as exc:
+        msg = str(exc)
+        if isinstance(exc, asyncio.TimeoutError):
+            msg = "timeout"
+        logger.error("failed to connect to scheduler at %r: %s",
+                     str(args.socket_path),
+                     msg)
+        raise RuntimeError(
+            "failed to connect to scheduler"
+        )
+
+    request = {
+        "command": "force-prune",
+        "force-prune": {
+            "repositories": list(set(args.repositories)),
+        }
+    }
+
+    response, data = yield from endpoint.request(
+        protocol.ToplevelCommand.EXTENDED_REQUEST,
+        request,
+    )
+
+    print(response, data)
+
+
+def autoloop(loop, f, *args, **kwargs):
+    if asyncio.iscoroutinefunction(f):
+        return loop.run_until_complete(f(*args, **kwargs))
+    else:
+        return f(*args, **kwargs)
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -189,6 +358,12 @@ def main():
         help="Execute the scheduler (runs in foreground)"
     )
     subparser.set_defaults(func=cmd_run)
+    subparser.add_argument(
+        "-d", "--daemonize",
+        action="store_true",
+        default=False,
+        help="Daemonize after setup instead of running in foreground",
+    )
 
     subparser = subparsers.add_parser(
         "status",
@@ -203,7 +378,45 @@ def main():
     )
     subparser.set_defaults(func=cmd_reload)
 
+    subparser = subparsers.add_parser(
+        "stop",
+        help="Connect to a running scheduler and ask it to stop"
+    )
+    subparser.set_defaults(func=cmd_stop)
+
+    subparser = subparsers.add_parser(
+        "force-archive",
+        help="Force an archive job to run",
+    )
+    subparser.add_argument(
+        "job",
+        help="Name of the job",
+    )
+    subparser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        help="Only run the job on this repository. May be given multiple times."
+    )
+    subparser.set_defaults(func=cmd_force_archive)
+
+    subparser = subparsers.add_parser(
+        "force-prune",
+        help="Force a prune job to run",
+    )
+    subparser.add_argument(
+        "repositories",
+        metavar="REPO-ID",
+        nargs="+",
+        help="ID of the repositories to prune",
+    )
+    subparser.set_defaults(func=cmd_force_prune)
+
     args = parser.parse_args()
+
+    if not hasattr(args, "func"):
+        print("select a subcommand (use --help)", file=sys.stderr)
+        sys.exit(1)
 
     logging.basicConfig(
         level={
@@ -220,6 +433,6 @@ def main():
 
     loop = asyncio.get_event_loop()
     try:
-        sys.exit(loop.run_until_complete(args.func(loop, args)) or 0)
+        sys.exit(autoloop(loop, args.func, loop, args) or 0)
     finally:
         loop.close()

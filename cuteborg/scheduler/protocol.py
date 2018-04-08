@@ -33,6 +33,8 @@ class ToplevelCommand(enum.Enum):
 
     EXTENDED_REQUEST = b"EXT:"  # EXTended
 
+    EXIT = b"EXIT"  # EXIT
+
 
 class ControlProtocol(asyncio.Protocol):
     def __init__(self, logger, handler):
@@ -105,9 +107,13 @@ class ControlProtocol(asyncio.Protocol):
             if self._buffer_len < self._ext_size:
                 return state
 
-            data = toml.loads(
-                self._squash_buffer(self._ext_size).decode("utf-8")
-            )
+            raw_data = self._squash_buffer(self._ext_size).decode("utf-8")
+            try:
+                data = toml.loads(raw_data)
+            except:
+                raise ValueError("failed to decode message: {!r}".format(
+                    raw_data
+                ))
 
             self._process_command(
                 self._ext_cmd,

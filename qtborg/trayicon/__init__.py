@@ -3,6 +3,7 @@ import enum
 import itertools
 import pathlib
 import signal
+import subprocess
 
 from datetime import datetime
 
@@ -18,6 +19,35 @@ from .ui_main import Ui_StatusWindow
 
 
 SortRole = Qt.Qt.UserRole
+
+
+@asyncio.coroutine
+def try_start():
+    proc = yield from asyncio.create_subprocess_exec(
+        "cuteborg-scheduler",
+        "-vv",
+        "run",
+        "-d",
+        stdin=subprocess.DEVNULL,
+    )
+
+    yield from proc.wait()
+
+    return proc.returncode == 0
+
+
+@asyncio.coroutine
+def try_stop():
+    proc = yield from asyncio.create_subprocess_exec(
+        "cuteborg-scheduler",
+        "-vvv",
+        "stop",
+        stdin=subprocess.DEVNULL,
+    )
+
+    yield from proc.wait()
+
+    return proc.returncode == 0
 
 
 def _load_pixmap(name):
@@ -96,6 +126,13 @@ PRUNE_NONRUNNING_TEMPLATE = (
 def format_job_state_table(job, now, parts=None):
     parts = parts or []
 
+    if "progress" in job:
+        progress = job["progress"]
+        if progress.get("synced", 1) < 1:
+            parts.append("synchronizing")
+        else:
+            parts.append(CREATE_ARCHIVE_PROGRESS_TEMPLATE.format(**job))
+
     if "blocking" in job:
         blocking_info = job["blocking"]
         if blocking_info["reason"] == "sleep_until":
@@ -114,6 +151,11 @@ def format_job_state_table(job, now, parts=None):
         elif blocking_info["reason"] == "removable_device":
             parts.append(
                 "waiting for removable device",
+            )
+
+        elif blocking_info["reason"] == "network_host":
+            parts.append(
+                "waiting for network connectivity"
             )
 
         else:
@@ -146,6 +188,11 @@ def format_job_state_view(job):
         elif blocking_info["reason"] == "removable_device":
             parts.append(
                 "waiting for removable device",
+            )
+
+        elif blocking_info["reason"] == "network_host":
+            parts.append(
+                "waiting for network connectivity"
             )
 
         else:
@@ -313,25 +360,50 @@ class JobsModel(Qt.QAbstractTableModel):
             return state
 
         elif index.column() == self.COLUMN_LAST_RUN:
+            try:
+                last_run = job["last_run"]
+            except KeyError:
+                if role == SortRole:
+                    return float("-inf")
+                return "never"
             if role == SortRole:
-                return (job["last_run"] - self.REFERENCE_TIME).total_seconds()
+                if last_run is None:
+                    last_run = datetime.utcnow()
+                return (last_run - self.REFERENCE_TIME).total_seconds()
+            elif role == Qt.Qt.ToolTipRole:
+                return str(last_run)
             else:
-                return str(job["last_run"])
+                return babel.dates.format_timedelta(
+                    last_run - datetime.utcnow(),
+                    add_direction=True,
+                    granularity='minute',
+                )
 
         elif index.column() == self.COLUMN_NEXT_RUN:
             try:
                 wakeup_at = job["blocking"]["struct_info"]["wakeup_at"]
             except KeyError:
                 if role == SortRole:
-                    return float("inf")
+                    return float("-inf")
                 return "now"
             if role == SortRole:
                 return (wakeup_at - self.REFERENCE_TIME).total_seconds()
-            else:
+            elif role == Qt.Qt.ToolTipRole:
                 return str(wakeup_at)
+            else:
+                return babel.dates.format_timedelta(
+                    wakeup_at - datetime.utcnow(),
+                    granularity='minute',
+                    add_direction=True,
+                )
 
         elif index.column() == self.COLUMN_PROGRESS:
             if job["type"] == "create_archive" and "progress" in job:
+                progress = job["progress"]
+                if progress["synced"] < 1:
+                    return "synchronizing ({:.0f}%)".format(
+                        progress["synced"] * 100,
+                    )
                 return "archived {} from {} files".format(
                     job["progress"]["uncompressed"],
                     job["progress"]["nfiles"],
@@ -352,6 +424,8 @@ class ErrorCondition(enum.Enum):
     REMOVABLE_DEVICE_MISSING = \
         "A removable device ({}) must be inserted for backup jobs to continue."
     OTHER_ERROR = "Error: {}"
+    NETWORK_HOST = \
+        "Cannot access borg server at {!r}{}."
 
 
 class Main(Qt.QMainWindow):
@@ -379,6 +453,8 @@ class Main(Qt.QMainWindow):
         }
 
         self._connected = False
+        self._stop = False
+        self._quit = False
         self._jobs = []
         self._error_conditions = set()
         self._curr_icon = None, "error"
@@ -447,6 +523,7 @@ class Main(Qt.QMainWindow):
             Qt.QMessageBox.Ok | Qt.QMessageBox.Cancel,
         )
 
+        self._quit = True
         if result == Qt.QMessageBox.Ok:
             self.stop_event.set()
 
@@ -459,6 +536,8 @@ class Main(Qt.QMainWindow):
             Qt.QMessageBox.Ok | Qt.QMessageBox.Cancel,
         )
 
+        self._quit = True
+        self._stop = True
         if result == Qt.QMessageBox.Ok:
             self.stop_event.set()
 
@@ -551,6 +630,15 @@ class Main(Qt.QMainWindow):
                         (ErrorCondition.REMOVABLE_DEVICE_MISSING,
                          (blocking_info["struct_info"]["device_uuid"],))
                     )
+                elif blocking_info["reason"] == "network_host":
+                    extra = blocking_info["struct_info"].get("extra")
+                    if extra is not None:
+                        extra = " ({})".format(extra)
+                    current_conditions.add(
+                        (ErrorCondition.NETWORK_HOST,
+                         (blocking_info["struct_info"]["host"],
+                          extra))
+                    )
 
         for key in set(self._error_conditions):
             if key not in current_conditions:
@@ -575,10 +663,6 @@ class Main(Qt.QMainWindow):
                         repo=job["args"]["repo"],
                         status=(
                             format_job_state_table(job, now)
-                            if "progress" not in job
-                            else CREATE_ARCHIVE_PROGRESS_TEMPLATE.format(
-                                    progress=job["progress"]
-                            )
                         ),
                     )
                 )
@@ -694,6 +778,10 @@ class Main(Qt.QMainWindow):
                                   str(self.socket_path),
                                   msg)
             self._update_jobs({})
+            self._set_error_condition(
+                ErrorCondition.SCHEDULER_NOT_RUNNING,
+                suppress_notify=not self._connected
+            )
             yield from asyncio.sleep(10)
 
         self._connected = True
@@ -797,5 +885,10 @@ class Main(Qt.QMainWindow):
         self.trayicon.show()
         stop_future = asyncio.ensure_future(self.stop_event.wait())
 
-        while True:
+        yield from try_start()
+
+        while not self._quit:
             yield from self._update_loop(stop_future)
+
+        if self._stop:
+            yield from try_stop()

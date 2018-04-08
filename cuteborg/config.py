@@ -169,6 +169,10 @@ class RepositoryConfig(ConfigElementBase):
         result.load_from_raw(raw)
         return result
 
+    def setup_context(self, ctx):
+        if self.encryption_mode != EncryptionMode.NONE:
+            ctx.passphrase = self.encryption_passphrase
+
 
 class LocalRepositoryConfig(RepositoryConfig):
     path = None
@@ -221,7 +225,7 @@ class LocalRepositoryConfig(RepositoryConfig):
         return self.path
 
     def setup_context(self, ctx):
-        pass
+        super().setup_context(ctx)
 
 
 class RemoteRepositoryConfig(RepositoryConfig):
@@ -241,6 +245,9 @@ class RemoteRepositoryConfig(RepositoryConfig):
         self.host = remote_cfg["host"]
         self.user = remote_cfg.get("user")
         self.borg_path = remote_cfg.get("borg_path")
+        self.ratelimit = int(remote_cfg.get("ratelimit", 0))
+        if self.ratelimit < 0:
+            self.ratelimit = None
 
     def to_raw(self):
         raw = super().to_raw()
@@ -255,6 +262,9 @@ class RemoteRepositoryConfig(RepositoryConfig):
         if self.borg_path is not None:
             remote_cfg["borg_path"] = self.borg_path
 
+        if self.ratelimit is not None:
+            remote_cfg["ratelimit"] = self.ratelimit
+
         return raw
 
     def make_repository_path(self):
@@ -268,7 +278,9 @@ class RemoteRepositoryConfig(RepositoryConfig):
         return "".join(parts)
 
     def setup_context(self, ctx):
+        super().setup_context(ctx)
         ctx.borg_remote_path = self.borg_path
+        ctx.network_limit_builtin = self.ratelimit
 
 
 class ScheduleConfig(ConfigElementBase):

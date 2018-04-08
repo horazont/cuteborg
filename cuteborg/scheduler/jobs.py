@@ -1,6 +1,8 @@
 import abc
 import asyncio
 
+import pytz
+
 from datetime import datetime
 
 import cuteborg.backend
@@ -61,6 +63,16 @@ class Job(metaclass=abc.ABCMeta):
                 )
                 yield from asyncio.sleep(30)
                 continue
+            except cuteborg.backend.RepositoryUnreachable:
+                self.logger.warning(
+                    "repository is unreachable, will retry after 30 seconds"
+                )
+                self.scheduler.set_job_error(
+                    self.key,
+                    "repository is unreachable",
+                )
+                yield from asyncio.sleep(30)
+                continue
             break
 
     @abc.abstractmethod
@@ -90,12 +102,23 @@ class PeriodicRepositoryJob(Job):
 
     @asyncio.coroutine
     def exec(self, **kwargs):
+        # waits until the storage of the repository is reachable
+        repo_path = yield from self.scheduler.wait_for_repository_storage(
+            self,
+            self.repository_cfg
+        )
+
+        self.logger.debug(
+            "repository is at %r",
+            repo_path,
+        )
+
         self.logger.debug("locking repository %r", self.repository_cfg.id_)
         with (yield from self.scheduler.lock_repository(
                 self,
                 self.repository_cfg.id_)):
             self.logger.debug("locked repository %r", self.repository_cfg.id_)
-            yield from self._exec(**kwargs)
+            yield from self._exec(repo_path=repo_path, **kwargs)
 
     @asyncio.coroutine
     def run(self):
@@ -114,19 +137,7 @@ class PeriodicRepositoryJob(Job):
 
             self.logger.debug("next run is at %s", next_run)
             yield from self.scheduler.sleep_until(self, next_run)
-
-            # waits until the storage of the repository is reachable
-            repo_path = yield from self.scheduler.wait_for_repository_storage(
-                self,
-                self.repository_cfg
-            )
-
-            self.logger.debug(
-                "repository is at %r",
-                repo_path,
-            )
-
-            yield from self.scheduler.execute_job(self, repo_path=repo_path)
+            yield from self.scheduler.execute_job(self)
 
 
 class PruneRepository(PeriodicRepositoryJob):
@@ -195,7 +206,7 @@ class CreateArchive(PeriodicRepositoryJob):
                 self,
                 {
                     key: (" ".join(value)
-                          if not isinstance(value, int)
+                          if not isinstance(value, (int, float))
                           else value)
                     for key, value in progress.items()
                 }
