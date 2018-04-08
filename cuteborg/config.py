@@ -202,7 +202,7 @@ class LocalRepositoryConfig(RepositoryConfig):
             self.crypto_enabled = False
             self.crypto_passphrase = None
         else:
-            self.crypto_enabeld = crypto_cfg.get("enabled", True)
+            self.crypto_enabled = crypto_cfg.get("enabled", True)
             self.crypto_passphrase = crypto_cfg.get("passphrase")
 
     def to_raw(self):

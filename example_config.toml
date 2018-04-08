@@ -1,0 +1,112 @@
+# Maximum number of seconds scheduled jobs may be wrong
+max_slack=30
+
+# Interval when polling for devices and servers(in seconds)
+poll_interval=15
+
+# Default schedule for *all* tasks (prune and archive)
+[schedule]
+# The schedule interval. Can be 'minute', 'hour', 'day', 'week', 'month', 'year'
+interval_unit='minute'
+# The number of `interval_unit` after which the job runs next. E.g.:
+#
+#    interval_unit='hour'
+#    interval_step=2
+#
+# runs every two hours.
+interval_step=1
+
+# A repository
+[[repository]]
+# used to identify the repository in jobs
+id='homedir'
+# name shown in UI
+name='My home dir'
+# type. may be 'remote' or 'local'
+type='local'
+
+[repository.encryption]
+# mode can be 'none', 'keyfile' or 'repokey'
+# 'none' does not use any encryption.
+mode='none'
+
+# the passphrase for the encryption. MUST be given when encryption is used.
+# cuteborg does not support prompting for passwords.
+#passphrase=
+
+# for type='local' repositories, this subsection is required
+[repository.local]
+# path to the repository, relative to the root of the device (see below)
+path='/home/user/borg-repository'
+
+# optional section for repositories on removable devices
+#[repository.local.removable]
+# cuteborg will attempt to mount the partition with this UUID using UDisks2
+#device_uuid='caaba832-849a-46c1-8ee8-a1c60a38c93d'
+
+# optional section for repositories on removable devices encrypted with LUKS
+#[repository.local.crypto]
+# enable
+#enabled=true
+# the passphrase. may be omitted depending on the UDisks2 implementation
+#passphrase=
+
+# optional section to define a prune schedule
+# prune jobs are run for each archive job individually.
+#[repository.prune]
+# this section supports the keys 'hourly', 'daily', 'weekly', 'monthly' and
+# 'yearly'. the values are passed to the respective borg prune arguments and
+# define which archives are removed. please read the borg-prune manpage for
+# details.
+#hourly=4
+#daily=24
+
+# optional section to define a custom schedule for the prune job
+# (recommended, you’d normally want to prune more rarely than you archive)
+# the syntax is the same as for the global [schedule]
+#[repository.prune.schedule]
+#interval_unit='minute'
+#interval_step=10
+
+[[repository]]
+id='remote-server'
+name='My fancy server'
+type='remote'
+
+[repository.encryption]
+mode='none'
+
+# for type='remote' repositories, this subsection is required
+[repository.remote]
+# hostname
+host='some.server.example'
+# path to the borg repository
+path='/home/user/borg-repository'
+# optional path to the borg exectable if it’s not in the PATH
+#borg_path='/home/horazont/.local/bin/borg'
+
+# define an archive job
+[[job]]
+# currently, only 'simple' is supported
+type='simple'
+# name shown in the UI and used for archives
+# MUST BE UNIQUE AND NO JOB NAME MUST BE THE PREFIX OF ANOTHER JOB NAME
+name='test'
+
+# list of repository 'id' values to run the job in
+repositories=[
+    'homedir',
+    'remote-server',
+]
+
+# paths which are to be included in the archive
+sources=[
+    "/home/horazont/Projects/python/",
+]
+
+# optional section which defines the compression to be used
+[job.compression]
+# supports 'lz4', 'lzma', 'zlib' and 'none'. see the borg-create manpage
+method='lzma'
+# level depends on the method used.
+level=9
