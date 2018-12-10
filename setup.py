@@ -13,6 +13,7 @@ with open(os.path.join(here, "README.rst"), encoding="utf-8") as f:
 
 install_requires = [
     'borgbackup',
+    'pytz',
 ]
 
 try:
@@ -49,5 +50,6 @@ setup(
             "cuteborg=cuteborg.cli:main",
             "qtborg-trayicon=qtborg.trayicon.cli:main",
         ]
-    }
+    },
+    include_package_data=True,
 )
