@@ -25,7 +25,7 @@ except ImportError:
 
 setup(
     name="cuteborg",
-    version="0.1.3",
+    version="0.1.4",
     description="Third-party scheduler and UI frontend for Borgbackup",
     long_description=long_description,
     url="https://github.com/horazont/cuteborg",
