@@ -43,13 +43,16 @@ SortRole = Qt.Qt.UserRole
 
 @asyncio.coroutine
 def try_start():
-    proc = yield from asyncio.create_subprocess_exec(
-        "cuteborg-scheduler",
-        "-vv",
-        "run",
-        "-d",
-        stdin=subprocess.DEVNULL,
-    )
+    try:
+        proc = yield from asyncio.create_subprocess_exec(
+            "cuteborg-scheduler",
+            "-vv",
+            "run",
+            "-d",
+            stdin=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
 
     yield from proc.wait()
 
