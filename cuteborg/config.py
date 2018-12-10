@@ -266,7 +266,7 @@ class RemoteRepositoryConfig(RepositoryConfig):
         self.user = remote_cfg.get("user")
         self.borg_path = remote_cfg.get("borg_path")
         self.ratelimit = int(remote_cfg.get("ratelimit", 0))
-        if self.ratelimit < 0:
+        if self.ratelimit <= 0:
             self.ratelimit = None
 
     def to_raw(self):
